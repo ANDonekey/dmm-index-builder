@@ -41,3 +41,6 @@ README.md
 # D1 落地文档与 wrangler 配置不入库
 wrangler.toml
 D1-*.md
+
+# Worker 本地开发
+.wrangler/
