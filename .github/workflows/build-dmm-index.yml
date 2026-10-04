@@ -1,0 +1,225 @@
+name: build-dmm-index
+
+# 从 r18.dev 官方拉取最新 dump → 生成精简索引库 → 传为 artifact / release
+#
+# 事实依据（2026-10-05 实测 https://r18.dev/dumps）：
+#   - 官方说明：每周二 03:00~04:00 UTC 上传新 dump；旧版本保留 90 天后可能删除
+#   - 数据许可：CC0
+#   - 最新版直链：https://r18.dev/dumps/latest
+#     → 307 跳转到 https://r18dotdev.s3.eu-west-1.wasabisys.com/dumps/r18dotdev_dump_<日期>.sql.gz
+#   - 存储后端 Wasabi S3：Accept-Ranges: bytes（支持断点续传）
+#     ETag 形如 "ed56035dabcb6cd447bb704e07143997-33"，带 -N 后缀（分块上传，非整文件 MD5）
+#
+# 触发：
+#   1. 定时（周二 04:10 UTC ≈ 北京 12:10，官方 03:00-04:00 上传，避开整点）
+#   2. 手动 dispatch（可指定日期 / 强制重建）
+#   3. repository_dispatch（源站/自建提醒推送）
+#
+# 产物：dmm-index.db（实测 ~53 MB / 62 万条），VPS 只需下载即用。
+
+on:
+  schedule:
+    # 周二 04:10 UTC = 北京 12:10。官方 03:00-04:00 UTC 上传，留 10 分钟余量。
+    - cron: '10 4 * * 2'
+  workflow_dispatch:
+    inputs:
+      dump_date:
+        description: '指定 dump 日期（YYYY-MM-DD）；留空 = 跟随 latest'
+        required: false
+        type: string
+      force:
+        description: '强制重建（即使 latest 与上次相同）'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [r18dev-dump-updated]
+
+permissions:
+  contents: write # 上传 release 资产
+
+concurrency:
+  group: build-dmm-index
+  cancel-in-progress: false # 避免中途取消留下半成品 release
+
+env:
+  LATEST_URL: 'https://r18.dev/dumps/latest'
+  DUMP_INDEX_URL: 'https://r18.dev/dumps'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install zstandard   # 读 .zst 用；本次流程实际走 zstd CLI
+
+      # ---------- 1. 解析要下载哪个 dump ----------
+      - name: Resolve dump URL
+        id: resolve
+        run: |
+          set -euo pipefail
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+          DATE="${{ inputs.dump_date }}"
+
+          if [ -n "$DATE" ]; then
+            # 指定日期：直接拼官方 S3 路径（已知命名规则 r18dotdev_dump_<date>.sql.gz）
+            URL="https://r18dotdev.s3.eu-west-1.wasabisys.com/dumps/r18dotdev_dump_${DATE}.sql.gz"
+          else
+            # 跟随 latest：取 307 的 Location 头（curl -L 会把 307 变成 200，测不出来）
+            URL=$(curl -fsSI -H "User-Agent: $UA" "$LATEST_URL" \
+                  | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}' | tail -1)
+            if [ -z "$URL" ]; then
+              echo "::error::无法从 $LATEST_URL 解析出重定向地址"; exit 1
+            fi
+            # 从文件名提取日期
+            DATE=$(basename "$URL" | sed -n 's/.*dump_\([0-9-]*\)\.sql\.gz/\1/p')
+          fi
+
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "url=${URL}"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### 输入"
+            echo ""
+            echo "- 日期: \`${DATE}\`"
+            echo "- 地址: ${URL}"
+            echo "- 说明: 数据许可 CC0，官方每周二 03:00-04:00 UTC 更新，保留 90 天"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check remote metadata (size / etag)
+        run: |
+          set -euo pipefail
+          URL="${{ steps.resolve.outputs.url }}"
+          echo "远程元数据:"
+          curl -fsSI "$URL" | tr -d '\r' \
+            | grep -i "content-length\|etag\|last-modified\|accept-ranges" | sed 's/^/  /'
+          echo "ETag 带 -N 后缀（分块上传），不能当整文件 MD5 用——本流程用本地 sha256 做完整性校验。" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 2. 缓存上一次的索引库用于 diff ----------
+      - name: Restore previous index
+        uses: actions/cache@v4
+        with:
+          path: prev-index.db
+          key: dmm-index-${{ steps.resolve.outputs.date }}
+
+      # ---------- 3. 下载（支持断点续传）----------
+      - name: Download dump
+        run: |
+          set -euo pipefail
+          URL="${{ steps.resolve.outputs.url }}"
+          # -C - 断点续传：CI 缓存或网络抖动时不用从头下 260 MB
+          curl -fL --retry 5 --retry-delay 5 --retry-connrefused \
+               -C - -o dump.sql.gz "$URL"
+          ls -lh dump.sql.gz | sed 's/^/  /'
+          sha256sum dump.sql.gz | tee dump.sha256 | sed 's/^/  /'
+
+      # ---------- 4. 解压 ----------
+      - name: Decompress
+        run: |
+          set -euo pipefail
+          # zstd -dc 比 gzip -dc 快 3~4 倍；1.38 GB 的差距是分钟级的
+          zstd -dc dump.sql.gz > dump.sql
+          ls -lh dump.sql | sed 's/^/  展开后: /'
+
+      # ---------- 5. 构建索引库 ----------
+      - name: Build index
+        run: |
+          set -euo pipefail
+          time python build-index.py -i dump.sql -o dmm-index.db --vacuum
+
+      # ---------- 6. 质量闸门：620,025 条逐条比对，不一致直接 fail ----------
+      - name: Verify index against dump (quality gate)
+        run: |
+          set -euo pipefail
+          # 这个校验器抓出过 4 个真实 bug（stem≠cid / 破平混搭 / pv3001 漏识别 等），
+          # 没有它错误会静默流到线上。**不要改成抽样。**
+          python verify-index.py
+          ls -lh dmm-index.db
+
+      # ---------- 7. 与上一版 diff ----------
+      - name: Diff against previous index
+        run: |
+          set -euo pipefail
+          if [ -f prev-index.db ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import sqlite3
+          def load(p):
+              c = sqlite3.connect(p)
+              return {r[0] for r in c.execute("SELECT cid FROM video")}
+          old, new = load("prev-index.db"), load("dmm-index.db")
+          added, removed = new - old, old - new
+          print("\n### 与上一版对比")
+          print(f"- 新增番号: **{len(added):,}**")
+          print(f"- 移除番号: **{len(removed):,}**")
+          if added:
+              print(f"- 新增样例: {', '.join(sorted(added)[:15])}")
+          if removed:
+              print(f"- 移除样例: {', '.join(sorted(removed)[:15])}")
+          PY
+          else
+            echo -e "\n### 与上一版对比\n- 无历史版本（首次运行）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ---------- 8. 摘要 ----------
+      - name: Summarize
+        run: |
+          set -euo pipefail
+          SIZE=$(stat -c%s dmm-index.db)
+          echo -e "\n### 产物\n- \`dmm-index.db\`: $((SIZE / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import sqlite3
+          c = sqlite3.connect("dmm-index.db")
+          total = c.execute("SELECT COUNT(*) FROM video").fetchone()[0]
+          print(f"- 番号总数: **{total:,}**\n")
+          print("| 档位 | 数量 |")
+          print("|---|---|")
+          for q, n in c.execute("SELECT quality, COUNT(*) FROM video GROUP BY quality ORDER BY COUNT(*) DESC"):
+              print(f"| {q} | {n:,} |")
+          print("\n| CDN 主机 | 数量 |")
+          print("|---|---|")
+          for h, n in c.execute("SELECT cdn, COUNT(*) FROM video GROUP BY cdn ORDER BY COUNT(*) DESC"):
+              print(f"| {h} | {n:,} |")
+          print("\n### dump 元信息")
+          for k, v in c.execute("SELECT key, value FROM meta"):
+              print(f"- **{k}**: {v}")
+          PY
+
+      # ---------- 9. 上传 artifact ----------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmm-index-${{ steps.resolve.outputs.date }}
+          path: dmm-index.db
+          retention-days: 30
+          compression-level: 9
+
+      # ---------- 10. 发到 rolling release ----------
+      - name: Publish as release asset
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATE="${{ steps.resolve.outputs.date }}"
+          TAG="index-${DATE}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "DMM 索引库 ${DATE}" \
+            --notes "由 GitHub Actions 自动构建（源：r18.dev/dumps，数据许可 CC0），勿手工修改。"
+          gh release upload "$TAG" dmm-index.db --clobber
+          echo -e "\n### 发布\n- release tag: \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/download/${TAG}/dmm-index.db" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 11. 清理大文件 ----------
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f dump.sql dump.sql.gz
+          df -h . | tail -1
