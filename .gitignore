@@ -37,3 +37,7 @@ dmm-preview-reference.ts
 
 # 文档不入库
 README.md
+
+# D1 落地文档与 wrangler 配置不入库
+wrangler.toml
+D1-*.md
