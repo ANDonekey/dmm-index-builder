@@ -140,7 +140,8 @@ jobs:
           set -euo pipefail
           # 这个校验器抓出过 4 个真实 bug（stem≠cid / 破平混搭 / pv3001 漏识别 等），
           # 没有它错误会静默流到线上。**不要改成抽样。**
-          python verify-index.py
+          # 路径必须显式传，不能依赖默认值（默认值是本地相对路径）
+          python verify-index.py dump.sql dmm-index.db
           ls -lh dmm-index.db
 
       # ---------- 7. 与上一版 diff ----------
