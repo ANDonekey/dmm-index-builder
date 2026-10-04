@@ -34,3 +34,6 @@ Thumbs.db
 .env.local
 config.local.yaml
 dmm-preview-reference.ts
+
+# 文档不入库
+README.md
