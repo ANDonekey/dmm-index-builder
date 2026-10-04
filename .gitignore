@@ -15,6 +15,14 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# 本地工作区记忆（私人，不应进仓库）
+.workbuddy/
+
+# 内部设计文档（不入库）
+方案-*.md
+预处理方案.md
+*DMM-预览视频解析规则.md
+
 # 编辑器 / 系统
 .vscode/
 .idea/
@@ -25,3 +33,4 @@ Thumbs.db
 .env
 .env.local
 config.local.yaml
+dmm-preview-reference.ts
