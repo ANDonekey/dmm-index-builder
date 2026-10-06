@@ -7,6 +7,7 @@
 *.sql.gz
 data/
 videos/
+d1-sync*/
 
 # Python
 __pycache__/
@@ -41,7 +42,12 @@ README.md
 # D1 落地文档与 wrangler 配置不入库
 wrangler.toml
 D1-*.md
+VPS-*.md
+
+# 反代服务编译产物
+dmm-proxy/dist/
 
 # Worker 本地开发
 .wrangler/
+.cloudflare/
 D1-*.md

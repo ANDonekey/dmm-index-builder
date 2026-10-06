@@ -16,6 +16,10 @@ name: build-dmm-index
 #   3. repository_dispatch（源站/自建提醒推送）
 #
 # 产物：dmm-index.db（实测 ~53 MB / 62 万条），VPS 只需下载即用。
+#
+# 后半程还会把索引库**增量**同步到 Cloudflare D1（步骤 11），供 Pages Functions 查表。
+# 需要三个仓库 secret：CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_DATABASE_ID。
+# 没配就自动跳过，索引库照常发布 —— D1 同步失败不会连累构建产物。
 
 on:
   schedule:
@@ -32,6 +36,15 @@ on:
         required: false
         default: false
         type: boolean
+      d1_sync:
+        description: '同步到 Cloudflare D1'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto    # 配了 CLOUDFLARE_API_TOKEN 就同步，没配就跳过
+          - force   # 忽略「变化比例」保护（首轮灌库 / 大改版时用）
+          - skip    # 只构建索引库，不动 D1
   repository_dispatch:
     types: [r18dev-dump-updated]
 
@@ -49,7 +62,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90   # 下载+解压 1.4GB dump 本来就要 20~30 分钟，再留 D1 同步的余量
 
     steps:
       - name: Checkout
@@ -107,7 +120,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: prev-index.db
+          # key 带日期必然命中不了（每次都是新日期），靠 restore-keys 回退到最近一版，
+          # 否则下面第 7 步的 diff 永远显示「无历史版本」。
           key: dmm-index-${{ steps.resolve.outputs.date }}
+          restore-keys: dmm-index-
 
       # ---------- 3. 下载（支持断点续传）----------
       - name: Download dump
@@ -218,7 +234,43 @@ jobs:
           echo "下载地址: https://github.com/${{ github.repository }}/releases/download/${TAG}/dmm-index.db" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- 11. 清理大文件 ----------
+      # ---------- 11. 增量同步到 Cloudflare D1 ----------
+      # 为什么只能增量：D1 免费版 10 万行写入/天，而 video 表有 292,621 行，
+      # 全量重灌一次就超 3 倍。sync-d1.py 的做法是：
+      #   ① 从 D1 游标分页读全表现状（~29 万行 read，占日限额 6%）
+      #   ② 与新索引库求差集（新增/变更/删除）
+      #   ③ 把差集打包成「多行一条」的 INSERT/DELETE（受单条 SQL ≤100KB 限制）
+      #   ④ 写回后立刻核对行数
+      # 从 D1 读现状而不是和上一版索引库 diff，是为了自愈：上一轮中途失败也不会永久错开。
+      - name: Sync to D1 (incremental)
+        id: d1sync
+        if: github.ref == 'refs/heads/main' && inputs.d1_sync != 'skip'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_DATABASE_ID: ${{ secrets.CLOUDFLARE_DATABASE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] \
+             || [ -z "${CLOUDFLARE_DATABASE_ID:-}" ]; then
+            echo "::warning::未配置 D1 相关 secret，跳过同步（索引库已照常发布）"
+            exit 0
+          fi
+          FLAGS=""
+          if [ "${{ inputs.d1_sync }}" = "force" ]; then
+            FLAGS="--force"
+          fi
+          python sync-d1.py -i dmm-index.db --outdir d1-sync --apply $FLAGS
+
+      - name: Upload D1 delta
+        if: steps.d1sync.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-delta-${{ steps.resolve.outputs.date }}
+          path: d1-sync
+          retention-days: 14
+
+      # ---------- 12. 清理大文件 ----------
       - name: Cleanup
         if: always()
         run: |
