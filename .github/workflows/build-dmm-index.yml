@@ -270,6 +270,13 @@ jobs:
           path: d1-sync
           retention-days: 14
 
+      # 把本次产物存成 prev-index.db，供下次 diff。
+      # 必须显式 cp：actions/cache 的保存发生在 job 末尾的 post 步骤，
+      # 如果没人写过 prev-index.db，它会报 "Path Validation Error ... no cache is being saved"，
+      # 于是缓存永远为空、第 10 步的 diff 永远显示「无历史版本」。
+      - name: Stash index as previous
+        run: cp dmm-index.db prev-index.db
+
       # ---------- 12. 清理大文件 ----------
       - name: Cleanup
         if: always()
