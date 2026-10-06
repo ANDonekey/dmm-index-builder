@@ -44,6 +44,7 @@ on:
         options:
           - auto    # 配了 CLOUDFLARE_API_TOKEN 就同步，没配就跳过
           - force   # 忽略「变化比例」保护（首轮灌库 / 大改版时用）
+          - bootstrap # 首次接入：D1 数据已正确，只补建状态行，不比对不写入
           - skip    # 只构建索引库，不动 D1
   repository_dispatch:
     types: [r18dev-dump-updated]
@@ -235,13 +236,17 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- 11. 增量同步到 Cloudflare D1 ----------
-      # 为什么只能增量：D1 免费版 10 万行写入/天，而 video 表有 292,621 行，
-      # 全量重灌一次就超 3 倍。sync-d1.py 的做法是：
-      #   ① 从 D1 游标分页读全表现状（~29 万行 read，占日限额 6%）
-      #   ② 与新索引库求差集（新增/变更/删除）
-      #   ③ 把差集打包成「多行一条」的 INSERT/DELETE（受单条 SQL ≤100KB 限制）
-      #   ④ 写回后立刻核对行数
-      # 从 D1 读现状而不是和上一版索引库 diff，是为了自愈：上一轮中途失败也不会永久错开。
+      # 两条硬约束：
+      #   写入：免费版 10 万行/天，video 表 292,621 行 → 全量重灌必超限，只能写差集。
+      #   读取：免费版 500 万行/天，一次全表读就 29 万行（6%）；
+      #         `SELECT COUNT(*)` 同样是全表扫描 —— 千万别拿它做校验。
+      #
+      # 所以 sync-d1.py 走元数据驱动：D1 里放一张 1 行的 d1_sync_state，
+      # 记录「现在对应哪一版索引」，每次运行只读那一行：
+      #   - index_id 没变 → 直接结束（0 行读、0 行写）
+      #   - index_id 变了 → 按旧 index_id 从 release 下载旧索引库本地求差集，
+      #                     只把差集打包成「多行一条」的 SQL 写回
+      # 兜底的 --reconcile（全表读）保留在脚本里，但**默认路径永不触发**。
       - name: Sync to D1 (incremental)
         id: d1sync
         if: github.ref == 'refs/heads/main' && inputs.d1_sync != 'skip'
@@ -249,6 +254,8 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_DATABASE_ID: ${{ secrets.CLOUDFLARE_DATABASE_ID }}
+          # --prev-from-release 要用 gh 下载旧索引库
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] \
@@ -257,10 +264,18 @@ jobs:
             exit 0
           fi
           FLAGS=""
+          EXTRA="--prev-from-release"
           if [ "${{ inputs.d1_sync }}" = "force" ]; then
             FLAGS="--force"
           fi
-          python sync-d1.py -i dmm-index.db --outdir d1-sync --apply $FLAGS
+          if [ "${{ inputs.d1_sync }}" = "bootstrap" ]; then
+            # 状态行还不存在，没有「旧版本」可拉
+            FLAGS="--bootstrap"
+            EXTRA=""
+          fi
+          python sync-d1.py -i dmm-index.db \
+            --index-id "${{ steps.resolve.outputs.date }}" \
+            --outdir d1-sync --apply $EXTRA $FLAGS
 
       - name: Upload D1 delta
         if: steps.d1sync.outputs.changed == 'true'
