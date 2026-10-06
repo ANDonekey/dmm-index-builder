@@ -300,8 +300,13 @@ def main():
         print(f"旧索引库 {args.prev_db}: {len(old):,} 键")
     elif args.prev_from_release:
         if not st:
-            die("状态行为空：不知道 D1 现在对应哪一版索引。"
-                "用 --bootstrap 补建状态，或用 --reconcile 全表对齐。")
+            # 不 die：让定时运行保持绿色，只是明确提示还没 bootstrap。
+            # 否则每周二都会因为「还没初始化」红一次，而索引库本身是好的。
+            print("::warning::D1 状态行为空，不知道当前对应哪一版索引。"
+                  "首次接入请先手动跑一次 d1_sync=bootstrap；"
+                  "本次跳过同步（不影响索引库构建与发布）。")
+            emit({"changed": "false", "skipped": "true", "need_bootstrap": "true"})
+            return
         old_path = download_prev_index(st["index_id"], "prev-index-dl")
         old, _ = load_target(old_path, ed1)
         print(f"旧索引库 {st['index_id']}: {len(old):,} 键")
