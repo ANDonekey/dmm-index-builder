@@ -183,9 +183,15 @@ class Index:
         }
 
     @staticmethod
-    def build_url(cdn, dirpath, stem, quality, variant):
+    def build_url(cdn, dirpath, stem, quality, variant, fmt=0):
         """由分列字段还原 DMM 直链（URL 不落库，见 build-index.py 的体积优化说明）"""
-        return f"https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/{stem}_{quality}_{variant}.mp4"
+        if fmt >= 2:
+            base = f"https://{cdn}.dmm.co.jp/pv/{dirpath}/"
+        else:
+            base = f"https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/"
+        if fmt % 2 == 0:
+            return f"{base}{stem}_{quality}_{variant}.mp4"
+        return f"{base}{stem}{quality}{variant}.mp4"
 
     def stats(self):
         return {

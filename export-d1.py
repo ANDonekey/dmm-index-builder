@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS video (
   stem      TEXT NOT NULL,
   quality   TEXT NOT NULL,
   variant   TEXT NOT NULL,
+  fmt       INTEGER NOT NULL DEFAULT 0,   -- URL 形态：见 build-index.py 的 FMT_*
   PRIMARY KEY (k_letters, k_num)
 ) WITHOUT ROWID;
 """
@@ -68,14 +69,17 @@ def cid_to_key(cid):
 
 
 def collect(db_path):
-    """读索引库，按归一化键去重，返回 {key: (cdn, dirpath, stem, quality, variant, cdn统计)}"""
+    """读索引库，按归一化键去重，返回 {key: (cdn, dirpath, stem, quality, variant, fmt, cdn统计)}"""
     conn = sqlite3.connect(db_path)
     db = conn.cursor()
+    # 向后兼容：fmt 列是后来加的，从 release 拉到的旧版索引库没有这一列。
+    # 旧库一律按 fmt=0（freepv + A 命名）处理，不能让 --prev-from-release 直接崩掉。
+    cols = {r[1] for r in db.execute("PRAGMA table_info(video)")}
+    sql = ("SELECT cid, cdn, dirpath, stem, quality, variant, "
+           + ("fmt" if "fmt" in cols else "0") + ", source, code FROM video")
     best = {}
     total = 0
-    for cid, cdn, dirpath, stem, q, v, source, code in db.execute(
-        "SELECT cid, cdn, dirpath, stem, quality, variant, source, code FROM video"
-    ):
+    for cid, cdn, dirpath, stem, q, v, fmt, source, code in db.execute(sql):
         total += 1
         k = cid_to_key(cid)
         if not k:
@@ -89,7 +93,7 @@ def collect(db_path):
         )
         cur = best.get(k)
         if cur is None or prio < cur[0]:
-            best[k] = (prio, cdn, dirpath, stem, q, v)
+            best[k] = (prio, cdn, dirpath, stem, q, v, fmt)
     conn.close()
     return best, total
 
@@ -155,11 +159,12 @@ def main():
 
     items = sorted(shards.get(args.shard, []))
     lines = [D1_SCHEMA] if args.shard == 0 else []
-    for (letters, num), (_prio, cdn, dirpath, stem, q, v) in items:
+    for (letters, num), (_prio, cdn, dirpath, stem, q, v, fmt) in items:
         lines.append(
-            f"INSERT OR REPLACE INTO video (k_letters,k_num,cdn,dirpath,stem,quality,variant) "
+            f"INSERT OR REPLACE INTO video "
+            f"(k_letters,k_num,cdn,dirpath,stem,quality,variant,fmt) "
             f"VALUES({sql_str(letters)},{int(num)},{sql_str(cdn)},{sql_str(dirpath)},"
-            f"{sql_str(stem)},{sql_str(q)},{sql_str(v)});"
+            f"{sql_str(stem)},{sql_str(q)},{sql_str(v)},{int(fmt)});"
         )
     with open(args.output, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

@@ -53,7 +53,7 @@ import urllib.request
 API = "https://api.cloudflare.com/client/v4"
 PAGE = 20000                 # 仅 --reconcile 全表读时用
 BATCH_BYTES = 80_000         # 单条 SQL 的体积上限（D1 硬限制 100 KB，留 20 KB 余量）
-UPSERT_COLS = "(k_letters,k_num,cdn,dirpath,stem,quality,variant)"
+UPSERT_COLS = "(k_letters,k_num,cdn,dirpath,stem,quality,variant,fmt)"
 
 # 只有 1 行的状态表。读取它就是 1 row read —— 这是正常路径唯一的读开销。
 STATE_DDL = """
@@ -178,9 +178,9 @@ def fetch_current(token, acc, db):
 def build_upsert_batches(upsert, limit=BATCH_BYTES):
     batches, cur, size = [], [], 0
     head_len = len("INSERT OR REPLACE INTO video " + UPSERT_COLS + " VALUES ")
-    for (letters, num), (cdn, dirpath, stem, q, v) in upsert:
+    for (letters, num), (cdn, dirpath, stem, q, v, fmt) in upsert:
         tup = (f"({sql_str(letters)},{int(num)},{sql_str(cdn)},{sql_str(dirpath)},"
-               f"{sql_str(stem)},{sql_str(q)},{sql_str(v)})")
+               f"{sql_str(stem)},{sql_str(q)},{sql_str(v)},{int(fmt)})")
         if cur and head_len + size + len(tup) + 2 > limit:
             batches.append(cur)
             cur, size = [], 0

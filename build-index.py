@@ -55,8 +55,10 @@ DUMP_VERSIONS = {
 }
 
 # freepv 清晰度，由高到低（用于选最优；freepv 天花板是 hhb）
-QUALITY_RANK = {"hhb": 5, "mhb": 4, "dmb": 3, "dm": 2, "sm": 1}
-QUALITIES_DESC = ["hhb", "mhb", "dmb", "dm", "sm"]
+# ⚠️ 4k 以前不在表里，导致 dump 里 1,803 条 4k/4ks 预览被整类丢弃。
+#    4k 画质高于 hhb，排在它上面。
+QUALITY_RANK = {"4k": 6, "hhb": 5, "mhb": 4, "dmb": 3, "dm": 2, "sm": 1}
+QUALITIES_DESC = ["4k", "hhb", "mhb", "dmb", "dm", "sm"]
 
 # 数据源优先级（档位相同时破平用）：trailer 表实测档位普遍更高，且更权威
 SOURCE_RANK = {"sample": 1, "trailer": 2}
@@ -66,10 +68,41 @@ SOURCE_RANK = {"sample": 1, "trailer": 2}
 # ⚠️ CDN 主机不止 cc3001：库里还有 pv3001.dmm.co.jp（实测存在，且这批多是 mhb 高档）。
 #    早期只认 cc3001，把 28 条 pv3001 的 mhb 记录误降级成 dmb（校验时发现）。
 CDN_HOSTS = ("cc3001", "pv3001", "cc3002", "cc3003")
+
+# dump 里其实并存**两套**预览地址体系，以前只认了第一套，第二套整类丢弃：
+#
+#   ① freepv（老）: https://{cdn}.dmm.co.jp/litevideo/freepv/{a}/{ab}/{stem}/{文件名}.mp4
+#   ② pv（新）    : https://{cdn}.dmm.co.jp/pv/{token}/{文件名}.mp4
+#      token 是 62 字符的随机串，每个作品一个，无法推导 —— 必须落库。
+#
+# 两套里的文件名又各有两种命名：
+#   A: {stem}_{quality}_{variant}.mp4    例 1sdjs206_mhb_w.mp4
+#   B: {stem}{quality}{variant}.mp4      例 1sdjs00383mhb.mp4（variant 可缺省）
+#
+# 于是共 4 种组合，用 fmt 区分（见下面的 FMT_* 常量）。
+# 实测（2026-10-07）：漏掉 ② 与 ①B 共造成 104,933 条可播放预览未收录（+32.4%）。
+FMT_FREEPV_A = 0   # /litevideo/freepv/{dirpath}/{stem}_{q}_{v}.mp4
+FMT_FREEPV_B = 1   # /litevideo/freepv/{dirpath}/{stem}{q}{v}.mp4
+FMT_PV_A = 2       # /pv/{token}/{stem}_{q}_{v}.mp4
+FMT_PV_B = 3       # /pv/{token}/{stem}{q}{v}.mp4
+
+_HOST = r"^https?://(?P<cdn>" + "|".join(CDN_HOSTS) + r")\.dmm\.(?:co\.jp|com)"
+# 文件名里 quality 的候选（长的在前，避免 4k 被 hhb 之类抢匹配）
+_Q = r"(?P<quality>4k|hhb|hmb|mhb|dmb|dm|sm)"
+
 FREEPV_RE = re.compile(
-    r"^https?://(?P<cdn>" + "|".join(CDN_HOSTS) + r")\.dmm\.(?:co\.jp|com)/litevideo/freepv/"
-    r"[^/]+/[^/]+/(?P<stem>[^/]+)/(?P=stem)_(?P<quality>[a-z0-9]+)_(?P<variant>[ws])\.mp4$"
+    _HOST + r"/litevideo/freepv/"
+    r"[^/]+/[^/]+/(?P<stem>[^/]+)/(?P=stem)_" + _Q + r"_(?P<variant>[ws])\.mp4$"
 )
+# ①B：stem 与 quality 之间没有下划线；variant 可缺省
+FREEPV_RE_B = re.compile(
+    _HOST + r"/litevideo/freepv/"
+    r"[^/]+/[^/]+/(?P<stem>[^/]+)/(?P=stem)" + _Q + r"(?P<variant>[ws]?)\.mp4$"
+)
+PV_RE = re.compile(_HOST + r"/pv/(?P<token>[^/]+)/"
+                   r"(?P<stem>[^/]+)_" + _Q + r"_(?P<variant>[ws])\.mp4$")
+PV_RE_B = re.compile(_HOST + r"/pv/(?P<token>[^/]+)/"
+                     r"(?P<stem>[^/]+)" + _Q + r"(?P<variant>[ws]?)\.mp4$")
 
 # 目标表的列序（从 dump 的 COPY 头里读到，固定不变）
 TRAILER_COLS = ["content_id", "url", "timestamp"]
@@ -106,8 +139,9 @@ CREATE TABLE IF NOT EXISTS video (
   cdn            TEXT NOT NULL,      -- cc3001 | pv3001 | …
   dirpath        TEXT NOT NULL,      -- freepv 之后的目录路径，如 1/104/104fsmd29
   stem           TEXT NOT NULL,      -- 文件名主体，如 104fsmd00029（与 cid 可能不同！）
-  quality        TEXT NOT NULL,      -- hhb/mhb/dmb/dm/sm
-  variant        TEXT NOT NULL,      -- w | s
+  quality        TEXT NOT NULL,      -- 4k/hhb/mhb/dmb/dm/sm
+  variant        TEXT NOT NULL,      -- w | s；B 形态下可为空串
+  fmt            INTEGER NOT NULL DEFAULT 0,  -- FMT_*：URL 形态（路径前缀 + 是否有下划线）
   size_hint      INTEGER NOT NULL DEFAULT 0,
   source         TEXT NOT NULL,      -- trailer（高）| sample（低）
   verified       INTEGER NOT NULL DEFAULT 0,
@@ -122,9 +156,24 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
-def build_url(cdn: str, dirpath: str, stem: str, quality: str, variant: str) -> str:
-    """把库里的分列字段还原成 DMM 直链。"""
-    return f"https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/{stem}_{quality}_{variant}.mp4"
+def build_url(cdn: str, dirpath: str, stem: str, quality: str, variant: str,
+              fmt: int = FMT_FREEPV_A) -> str:
+    """
+    把库里的分列字段还原成 DMM 直链。
+
+    fmt 决定两件事：走哪个路径前缀，以及 quality/variant 前面有没有下划线。
+      FMT_FREEPV_A/B → https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/...
+      FMT_PV_A/B     → https://{cdn}.dmm.co.jp/pv/{dirpath}/...      （dirpath 即 token）
+      A → {stem}_{quality}_{variant}.mp4
+      B → {stem}{quality}{variant}.mp4   （variant 可缺省）
+    """
+    if fmt >= FMT_PV_A:
+        base = f"https://{cdn}.dmm.co.jp/pv/{dirpath}/"
+    else:
+        base = f"https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/"
+    if fmt % 2 == 0:
+        return f"{base}{stem}_{quality}_{variant}.mp4"
+    return f"{base}{stem}{quality}{variant}.mp4"
 
 
 # ---------- 输入：支持 .gz / .sql / stdin ----------
@@ -148,30 +197,55 @@ def open_dump(path):
 
 def normalize_and_parse(url):
     """
-    解析并规范化 freepv URL。
+    解析并规范化预览视频 URL（freepv 老体系 + pv 新体系 × A/B 两种命名）。
 
-    返回 (dirpath, stem, quality, variant)，其中
-      dirpath = freepv 之后的路径（末段目录名去掉下划线后缀），如 5/531/5314gnbd01156
-      stem    = 文件名去掉 _quality_variant 后的主体
-    不满足形态的返回 None。URL 在运行时用 build_url() 拼装，不落库。
+    返回 (dirpath, stem, quality, variant, cdn, fmt)，其中
+      dirpath = freepv 之后的目录路径（如 1/1sd/1sdjs206）；pv 体系下则是那个 62 字符 token
+      stem    = 文件名主体（去掉 quality/variant 后缀）
+      fmt     = FMT_* 之一，决定运行时怎么把上面这些拼回完整 URL
+    不满足任何已知形态的返回 None。完整 URL 运行时用 build_url() 拼装，不落库。
     """
     if not url or url == NULL:
         return None
     u = url.strip()
     if not u.startswith(("http://", "https://")):
         return None
+
+    # pv 新体系：/pv/{token}/{文件名}
+    m = PV_RE.match(u)
+    if m:
+        return (m.group("token"), m.group("stem"), m.group("quality"),
+                m.group("variant"), m.group("cdn"), FMT_PV_A)
+    m = PV_RE_B.match(u)
+    if m:
+        return (m.group("token"), m.group("stem"), m.group("quality"),
+                m.group("variant") or "", m.group("cdn"), FMT_PV_B)
+
+    # freepv 老体系：/litevideo/freepv/{a}/{ab}/{stem}/{文件名}
     m = FREEPV_RE.match(u)
-    if not m:
-        return None
-    stem = m.group("stem")
-    cdn = m.group("cdn")
-    # dirpath：从 URL 取出 freepv/ 之后、最后一层目录之前的部分
-    tail = u.split("/litevideo/freepv", 1)[1].lstrip("/")  # 如 5/531/5314gnbd01156/stem_dmb_w.mp4
+    if m:
+        d = _freepv_dirpath(u)
+        if d is None:
+            return None
+        return (d, m.group("stem"), m.group("quality"),
+                m.group("variant"), m.group("cdn"), FMT_FREEPV_A)
+    m = FREEPV_RE_B.match(u)
+    if m:
+        d = _freepv_dirpath(u)
+        if d is None:
+            return None
+        return (d, m.group("stem"), m.group("quality"),
+                m.group("variant") or "", m.group("cdn"), FMT_FREEPV_B)
+    return None
+
+
+def _freepv_dirpath(u):
+    """取出 freepv/ 之后、文件名之前的那段目录路径。"""
+    tail = u.split("/litevideo/freepv", 1)[1].lstrip("/")  # 如 1/1sd/1sdjs206/xx_mhb_w.mp4
     parts = tail.split("/")
     if len(parts) < 3:
         return None
-    dirpath = "/".join(parts[:-1])
-    return dirpath, stem, m.group("quality"), m.group("variant"), cdn
+    return "/".join(parts[:-1])
 
 
 def cid_to_code(cid):
@@ -210,7 +284,7 @@ class Builder:
 
     def offer(self, cid, parsed, code, source, size_hint=0):
         self.stats[source] = self.stats.get(source, 0) + 1
-        dirpath, stem, quality, variant, cdn = parsed
+        dirpath, stem, quality, variant, cdn, fmt = parsed
         rank = QUALITY_RANK.get(quality)
         if rank is None:
             self.stats["rejected"] += 1
@@ -218,7 +292,7 @@ class Builder:
         cur = self.best.get(cid)
         if cur is None:
             self.stats["accepted"] += 1
-            self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint]
+            self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint, fmt]
             self.dirty.add(cid)
             return
         # 破平规则：先比档位，档位相同再比数据源优先级（trailer 优先于 sample）。
@@ -227,7 +301,7 @@ class Builder:
         # 两者都是 dmb_w 档），只换 quality 会拼出混搭的错误 URL。
         if rank > cur[0] or (rank == cur[0] and SOURCE_RANK.get(source, 0) > SOURCE_RANK.get(cur[6], 0)):
             self.stats["upgraded"] += 1
-            self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint]
+            self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint, fmt]
             self.dirty.add(cid)
         if code and cid not in self.code_map:
             self.code_map[cid] = code
@@ -245,11 +319,12 @@ class Builder:
         # best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint]
         self.db.executemany(
             "INSERT OR REPLACE INTO video"
-            "(cid,code,cdn,dirpath,stem,quality,variant,size_hint,source,verified,verified_bytes,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,0,0,?)",
+            "(cid,code,cdn,dirpath,stem,quality,variant,fmt,size_hint,source,"
+            "verified,verified_bytes,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?)",
             (
                 (cid, self.code_map.get(cid) or cid_to_code(cid),
-                 v[1], v[2], v[3], v[4], v[5], v[7], v[6], now)
+                 v[1], v[2], v[3], v[4], v[5], v[8], v[7], v[6], now)
                 for cid, v in self.best.items() if cid in self.dirty
             ),
         )
@@ -353,8 +428,10 @@ class Builder:
                     # CRLF 兼容：去掉尾部 \r
                     if raw.endswith(b"\r"):
                         raw = raw[:-1]
-                    # 快速过滤：非目标表的数据行绝大多数没有 freepv 特征
-                    if b"/litevideo/freepv/" not in raw:
+                    # 快速过滤：非目标行绝大多数没有预览地址特征。
+                    # ⚠️ 两套体系都要放行：freepv（老）+ pv（新，/pv/{token}/）。
+                    #    以前只写了 freepv，pv 体系那 9 万条被整类跳过。
+                    if b"/litevideo/freepv/" not in raw and b"/pv/" not in raw:
                         continue
                     p = raw.split(b"\t")
                     if len(p) <= max(idx_url, IDX_DVD_ID):

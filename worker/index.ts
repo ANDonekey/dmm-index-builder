@@ -22,6 +22,7 @@ interface Row {
   quality: string;
   variant: string;
   cdn: string;
+  fmt?: number;
 }
 
 /** 番号归一化：剥离连字符/空格，拆出字母段与数字段（去前导零） */
@@ -32,8 +33,14 @@ function normalizeCode(code: string): { letters: string; num: number } | null {
   return { letters: m[2], num: Number(m[3]) };
 }
 
+// fmt 决定路径前缀与下划线：见 build-index.py 的 FMT_*（0/1=freepv，2/3=pv；奇数=无下划线）
 function buildResult(r: Row, host: string, code: string) {
-  const path = `/litevideo/freepv/${r.dirpath}/${r.stem}_${r.quality}_${r.variant}.mp4`;
+  const fmt = r.fmt ?? 0;
+  const file =
+    fmt % 2 === 0
+      ? `${r.stem}_${r.quality}_${r.variant}.mp4`
+      : `${r.stem}${r.quality}${r.variant}.mp4`;
+  const path = fmt >= 2 ? `/pv/${r.dirpath}/${file}` : `/litevideo/freepv/${r.dirpath}/${file}`;
   return {
     code,
     quality: `${r.quality}_${r.variant}`,
@@ -59,7 +66,7 @@ async function lookupOne(env: Env, code: string, host: string) {
   if (!key) return { status: 400, body: { code, error: `invalid code: ${code}` } };
 
   const row = (await env.DB.prepare(
-    `SELECT dirpath, stem, quality, variant, cdn
+    `SELECT dirpath, stem, quality, variant, cdn, fmt
        FROM video
       WHERE k_letters = ?1 AND k_num = ?2
       LIMIT 1`
@@ -91,7 +98,7 @@ async function lookupMany(env: Env, codes: string[], host: string) {
     if (!nums.size) continue;
     const placeholders = [...nums].map(() => "?").join(",");
     const { results } = await env.DB.prepare(
-      `SELECT k_num, dirpath, stem, quality, variant, cdn
+      `SELECT k_num, dirpath, stem, quality, variant, cdn, fmt
          FROM video
         WHERE k_letters = ? AND k_num IN (${placeholders})`
     )

@@ -20,17 +20,20 @@
 
 import argparse
 import gzip
-import re
+import importlib.util
+import pathlib
 import sqlite3
 import sys
 
-PREFIX_RE = re.compile(
-    r"^https://(?P<cdn>" + "|".join(("cc3001", "pv3001", "cc3002", "cc3003"))
-    + r")\.dmm\.co\.jp/litevideo/freepv/[^/]+/[^/]+/(?P<stem>[^/]+)/"
-      r"(?P=stem)_(?P<q>[a-z0-9]+)_(?P<v>[ws])\.mp4$"
-)
-QRE = re.compile(r"_([a-z0-9]+)_([ws])\.mp4$")
-RANK = {"hhb": 5, "mhb": 4, "dmb": 3, "dm": 2, "sm": 1}
+# URL 形态（freepv/pv × A/B 命名）只有一处定义，就是 build-index.py。
+# 校验器直接复用它，避免两边各写一份正则而悄悄跑偏 —— 以前就是这么漏掉 pv 体系的。
+_spec = importlib.util.spec_from_file_location(
+    "build_index", pathlib.Path(__file__).with_name("build-index.py"))
+_bi = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_bi)
+normalize_and_parse = _bi.normalize_and_parse
+build_url = _bi.build_url
+RANK = _bi.QUALITY_RANK
 
 
 def open_dump(path):
@@ -41,11 +44,6 @@ def open_dump(path):
 
 def norm(u):
     return u.replace("http://", "https://").replace("cc3001.dmm.com", "cc3001.dmm.co.jp")
-
-
-def quality_of(url):
-    m = QRE.search(url)
-    return m.group(1) if m else None
 
 
 def main():
@@ -72,9 +70,13 @@ def main():
                 if line.startswith("\\."):
                     break
                 p = line.split("\t")
-                if len(p) < min_cols or p[url_idx] == "\\N" or "freepv" not in p[url_idx]:
+                if len(p) < min_cols or p[url_idx] == "\\N":
                     continue
-                q = quality_of(p[url_idx])
+                # 两套体系（freepv / pv）× 两种命名（A/B）都要收，交给 build-index 的正则判定
+                parsed = normalize_and_parse(p[url_idx])
+                if not parsed:
+                    continue
+                q = parsed[2]
                 if q in RANK:
                     original[key][p[0]] = (RANK[q], norm(p[url_idx]))
 
@@ -83,22 +85,21 @@ def main():
     # 2) 校验：拼装结果必须等于「两表按(档位,来源)取优」后的值
     c = sqlite3.connect(args.db)
     rows = c.execute(
-        "SELECT cid, cdn, dirpath, stem, quality, variant FROM video"
+        "SELECT cid, cdn, dirpath, stem, quality, variant, fmt FROM video"
     ).fetchall()
     print(f"索引库: {len(rows):,}\n")
 
     exact = mismatch = not_in_dump = 0
     bad = []
-    for cid, cdn, dirpath, stem, quality, variant in rows:
-        built = f"https://{cdn}.dmm.co.jp/litevideo/freepv/{dirpath}/{stem}_{quality}_{variant}.mp4"
-        m = PREFIX_RE.match(built)
-        rank = RANK.get(quality)
-        # URL 结构自校验（stem 与文件名必须一致，否则拼出来的路径是假的）
-        if not m or m.group("stem") != stem or m.group("q") != quality or m.group("v") != variant:
+    for cid, cdn, dirpath, stem, quality, variant, fmt in rows:
+        built = build_url(cdn, dirpath, stem, quality, variant, fmt)
+        # URL 结构自校验：拼出来的串必须能被原样解析回去（覆盖 4 种形态）
+        if normalize_and_parse(built) != (dirpath, stem, quality, variant, cdn, fmt):
             mismatch += 1
             if len(bad) < 5:
                 bad.append((cid, "URL 结构自校验失败", built))
             continue
+        rank = RANK.get(quality)
         cands = [d[cid] for d in original.values() if cid in d]
         if not cands:
             not_in_dump += 1
