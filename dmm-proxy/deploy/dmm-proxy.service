@@ -1,0 +1,25 @@
+[Unit]
+Description=DMM freepv reverse proxy (disk cache + JP proxy upstream)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmmproxy
+Group=dmmproxy
+EnvironmentFile=/etc/dmm-proxy.env
+WorkingDirectory=/opt/dmm-proxy
+ExecStart=/opt/dmm-proxy/dmm-proxy
+Restart=always
+RestartSec=3
+
+# 安全加固
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/cache/dmmpv
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

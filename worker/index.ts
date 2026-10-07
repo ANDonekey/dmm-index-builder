@@ -14,7 +14,12 @@
 
 interface Env {
   DB: D1Database;
+  /** 反代域名后缀；不配就用线上那个。见 wrangler.toml 的 [vars] */
+  PROXY_HOST?: string;
 }
+
+/** VPS 上 nginx 的 server_name 是固定的，拼 URL 必须用常量而不是请求的 host */
+const DEFAULT_PROXY_HOST = "fastcdn.dpdns.org";
 
 interface Row {
   dirpath: string;
@@ -124,7 +129,10 @@ async function lookupMany(env: Env, codes: string[], host: string) {
 
 async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const host = request.headers.get("host") || url.host;
+  // ⚠️ 不能用 request.headers 的 host：部署在 *.workers.dev / *.pages.dev 上时
+  //    那会拼出 https://cc3001.xxx.workers.dev/... 这种根本不存在的地址。
+  //    反代域名是 VPS nginx 的 server_name，固定值。
+  const host = env.PROXY_HOST || DEFAULT_PROXY_HOST;
 
   if (request.method === "OPTIONS") {
     return new Response(null, {

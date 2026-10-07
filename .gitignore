@@ -51,3 +51,6 @@ dmm-proxy/dist/
 .wrangler/
 .cloudflare/
 D1-*.md
+
+# Go 编译产物（Windows 下 go build 直接产出 .exe）
+dmm-proxy/*.exe
