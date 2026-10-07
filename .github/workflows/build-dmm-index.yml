@@ -47,6 +47,15 @@ on:
           - bootstrap # 首次接入：假定 D1 数据已正确，只补建状态行（不校验）
           - reconcile # 兜底：全表读 D1 求真差集（~29 万行 read ≈ 日额度 6%，周更别用）
           - skip      # 只构建索引库，不动 D1
+      d1_max_write:
+        description: '本次最多写入多少行（留空=不限）。超过免费版 10 万行/天时必须分次'
+        required: false
+        type: string
+      d1_skip:
+        description: '续传：跳过前 N 行（填上一次运行输出的 next_skip）'
+        required: false
+        default: '0'
+        type: string
   repository_dispatch:
     types: [r18dev-dump-updated]
 
@@ -273,9 +282,20 @@ jobs:
             reconcile) EXTRA="--reconcile" ;;            # 不猜 D1 现状，全表读一遍求真差集
           esac
           echo "d1_sync=${{ inputs.d1_sync }} → EXTRA=$EXTRA FLAGS=$FLAGS"
+          # 分片续传：差集排序是确定的，用 --skip/--max-write 分多天灌完。
+          # 没写完时 sync-d1.py 不会更新状态行，下次重跑会接着上次的进度。
+          # 注意：不能写成 `[ -n "$X" ] && SLICE=...`，在 set -e 下条件为假会让整步退出。
+          SLICE=""
+          if [ -n "${{ inputs.d1_max_write }}" ]; then
+            SLICE="$SLICE --max-write ${{ inputs.d1_max_write }}"
+          fi
+          if [ -n "${{ inputs.d1_skip }}" ] && [ "${{ inputs.d1_skip }}" != "0" ]; then
+            SLICE="$SLICE --skip ${{ inputs.d1_skip }}"
+          fi
+          echo "SLICE=$SLICE"
           python sync-d1.py -i dmm-index.db \
             --index-id "${{ steps.resolve.outputs.date }}" \
-            --outdir d1-sync --apply $EXTRA $FLAGS
+            --outdir d1-sync --apply $EXTRA $FLAGS $SLICE
 
       - name: Upload D1 delta
         if: steps.d1sync.outputs.changed == 'true'

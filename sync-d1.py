@@ -121,6 +121,26 @@ def ensure_state(token, acc, db):
     d1_query(STATE_DDL, None, token, acc, db)
 
 
+def ensure_video_schema(ed1, token, acc, db):
+    """
+    补齐后加的列（D1 不支持 ADD COLUMN IF NOT EXISTS，得先查 PRAGMA 再决定）。
+
+    背景：fmt 列（URL 形态）是 2026-10-07 才引入的，线上已有的 video 表只有 7 列。
+    不加这一步，带 fmt 的 UPSERT 会直接报 "table video has no column named fmt"。
+    已有行的 fmt 自然是 0（旧代码只认 freepv + 有下划线），DEFAULT 0 正好对上。
+    """
+    rows, _ = d1_query("PRAGMA table_info(video)", None, token, acc, db)
+    cols = {r["name"] for r in rows}
+    if not cols:
+        print("D1 里没有 video 表，按 D1_SCHEMA 建表 ...", flush=True)
+        d1_query(ed1.D1_SCHEMA, None, token, acc, db)
+        return
+    if "fmt" not in cols:
+        d1_query("ALTER TABLE video ADD COLUMN fmt INTEGER NOT NULL DEFAULT 0",
+                 None, token, acc, db)
+        print("已为 D1 video 表补 fmt 列（存量行取默认值 0）", flush=True)
+
+
 def read_state(token, acc, db):
     rows, _ = d1_query(
         "SELECT index_id, rows, updated_at FROM d1_sync_state WHERE id = 1",
@@ -152,7 +172,7 @@ def load_target(db_path, ed1):
 
 # ---------- 全表读（仅 --reconcile，贵） ----------
 def fetch_current(token, acc, db):
-    cols = "k_letters,k_num,cdn,dirpath,stem,quality,variant"
+    cols = "k_letters,k_num,cdn,dirpath,stem,quality,variant,fmt"
     out, rows_read, last = {}, 0, None
     while True:
         if last is None:
@@ -167,7 +187,8 @@ def fetch_current(token, acc, db):
         rows_read += (meta.get("rows_read") or 0)
         for r in rows:
             out[(r["k_letters"], int(r["k_num"]))] = (
-                r["cdn"], r["dirpath"], r["stem"], r["quality"], r["variant"])
+                r["cdn"], r["dirpath"], r["stem"], r["quality"], r["variant"],
+                int(r.get("fmt") or 0))
         if len(rows) < PAGE:
             break
         last = (rows[-1]["k_letters"], int(rows[-1]["k_num"]))
@@ -262,6 +283,12 @@ def main():
                     help="即使 index_id 相同也重跑；同时忽略变化比例保护")
     ap.add_argument("--chunk", type=int, default=25000, help="SQL 文件每块语句数")
     ap.add_argument("--batch-bytes", type=int, default=BATCH_BYTES)
+    ap.add_argument("--max-write", type=int, default=0,
+                    help="本次最多写入多少条（0=不限）。用来突破免费版 10 万行/天上限，"
+                         "分多天灌库。没写完时不更新状态行。")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="跳过前 N 条（与 --max-write 配合续传）。"
+                         "差集已按 (k_letters,k_num) 排序，顺序是确定的，所以可安全续传。")
     args = ap.parse_args()
 
     token, acc, db = creds()
@@ -276,6 +303,7 @@ def main():
                     f.write(f"{k}={v}\n")
 
     ensure_state(token, acc, db)
+    ensure_video_schema(ed1, token, acc, db)
     st = read_state(token, acc, db)
     print(f"D1 状态: {st}" if st else "D1 状态: 无（首次运行）")
 
@@ -347,11 +375,11 @@ def main():
     files = []
     if changed:
         stmts = []
-        for (letters, num), (cdn, dirpath, stem, q, v) in upsert:
+        for (letters, num), (cdn, dirpath, stem, q, v, fmt) in upsert:
             stmts.append(
                 "INSERT OR REPLACE INTO video " + UPSERT_COLS + " VALUES("
                 f"{sql_str(letters)},{int(num)},{sql_str(cdn)},{sql_str(dirpath)},"
-                f"{sql_str(stem)},{sql_str(q)},{sql_str(v)});")
+                f"{sql_str(stem)},{sql_str(q)},{sql_str(v)},{int(fmt)});")
         for letters, num in delete:
             stmts.append(
                 f"DELETE FROM video WHERE k_letters={sql_str(letters)} "
@@ -374,33 +402,65 @@ def main():
         "delete": len(delete),
         "changed": bool(changed),
         "d1_rows_read": rows_read,
+        "slice": {"skip": start, "end": end, "remaining": remaining,
+                  "this_run": len(u_sel) + len(d_sel)},
         "chunks": files,
     }
 
+    # ---------- 切片：突破「10 万行/天」写入上限 ----------
+    # 差集顺序是确定的（upsert 先排、delete 后排，各自按 (k_letters,k_num) 排序），
+    # 所以 --skip/--max-write 按一维下标切片可以安全续传：不漏、不重复。
+    U, D = len(upsert), len(delete)
+    total_work = U + D
+    start = args.skip
+    end = total_work if not args.max_write else min(total_work, start + args.max_write)
+    u_sel = upsert[start:min(end, U)]
+    d_from = max(0, start - U)
+    d_sel = delete[d_from:d_from + max(0, end - max(U, start))]
+    remaining = total_work - end
+    if args.skip or args.max_write:
+        print(f"\n切片: 总 {total_work:,} 条，本次写第 {start:,}~{end:,} 条 "
+              f"(upsert {len(u_sel):,} / delete {len(d_sel):,})，剩 {remaining:,}")
+
     # ---------- 写入 ----------
     if args.apply:
-        if not changed:
-            print("\n无变化，不写 video 表。")
+        if not (u_sel or d_sel):
+            print("\n本次切片为空，不写 video 表。")
         else:
-            up = build_upsert_batches(upsert, args.batch_bytes)
-            de = build_delete_batches(delete, args.batch_bytes)
-            print(f"\n写入 D1: upsert {len(up)} 批 / delete {len(de)} 批 ...", flush=True)
+            up = build_upsert_batches(u_sel, args.batch_bytes)
+            de = build_delete_batches(d_sel, args.batch_bytes)
+            print(f"写入 D1: upsert {len(up)} 批 / delete {len(de)} 批 ...", flush=True)
             w1, n1 = apply_batches(up, token, acc, db, "upsert")
             w2, n2 = apply_batches(de, token, acc, db, "delete")
             print(f"\nrows_written: upsert={w1:,} delete={w2:,} 合计={w1 + w2:,}")
             manifest["applied"] = {"rows_written": w1 + w2, "requests": n1 + n2}
             emit({"rows_written": w1 + w2})
-        # 写状态行：不做 COUNT(*) —— 那是一次 29 万行的全表扫描
-        write_state(args.index_id, len(target), token, acc, db)
-        manifest["state_written"] = args.index_id
-        print(f"状态行已更新为 {args.index_id}（{len(target):,} 行）")
+
+        if remaining > 0:
+            # ⚠️ 没写完就绝不能更新状态行。否则下次运行读到「已是新版」会直接早退，
+            #    剩下的行永远不会补上，而且不会有任何报错。
+            print(f"\n::warning::还剩 {remaining:,} 条未写（免费版 10 万行/天上限）。"
+                  f"状态行保持旧值不动。等 UTC 00:00 额度重置后续传："
+                  f"\n  --skip {end} --max-write {args.max_write or 95000}",
+                  flush=True)
+            emit({"partial": "true", "remaining": remaining, "next_skip": end})
+        else:
+            # 写状态行：不做 COUNT(*) —— 那是一次 29 万行的全表扫描
+            write_state(args.index_id, len(target), token, acc, db)
+            manifest["state_written"] = args.index_id
+            print(f"状态行已更新为 {args.index_id}（{len(target):,} 行）")
+    else:
+        print("\n（未加 --apply，只算差集不写入）")
+        if remaining > 0:
+            print(f"需分 {-(total_work // -args.max_write) if args.max_write else 1} 次写入")
 
     with open(outdir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     emit({"changed": "true" if changed else "false",
           "upsert": len(upsert), "delete": len(delete),
-          "expected": len(target), "chunks": len(files)})
+          "expected": len(target), "chunks": len(files),
+          "remaining": remaining, "next_skip": end if remaining else 0})
 
     gh_sum = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_sum:
