@@ -172,7 +172,11 @@ func LoadConfig() (*Config, error) {
 	c.QuotaDailyBytes = envInt64("QUOTA_DAILY_BYTES", 2*1024*1024*1024)
 	c.QuotaMonthlyBytes = envInt64("QUOTA_MONTHLY_BYTES", 30*1024*1024*1024)
 	c.QuotaFactor = envFloat("QUOTA_BILLING_FACTOR", 0.1)
-	c.QuotaMaxPerRequest = envInt64("QUOTA_MAX_PER_REQUEST", 64*1024*1024)
+	// 单次回源真实字节硬上限。
+	// 原为 64MB，实测 DMM 有些预览片超过它（如 ipzz00236hhb.mp4 = 100.9MB），
+	// 会被 quotaReader 中途掐断，客户端随即无限重试、白烧配额和连接。
+	// 已知最大预览片在 100MB 量级，故放宽到 1GB：既够用，又仍能挡住真正的异常大文件。
+	c.QuotaMaxPerRequest = envInt64("QUOTA_MAX_PER_REQUEST", 1024*1024*1024)
 	c.QuotaExceededCode = envInt("QUOTA_EXCEEDED_CODE", http.StatusTooManyRequests)
 	c.RateLimitPerMin = envInt("RATE_LIMIT_PER_MIN", 60)
 
