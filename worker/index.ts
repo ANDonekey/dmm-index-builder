@@ -30,7 +30,14 @@ interface Row {
   fmt?: number;
 }
 
-/** 番号归一化：剥离连字符/空格，拆出字母段与数字段（去前导零） */
+/**
+ * 番号归一化：剥离连字符/空格，拆出字母段与数字段（去前导零）。
+ *
+ * ⚠️ 规则的事实来源是仓库根目录的 `cidkey.py`（`code_key`）。D1 里存的键由
+ * `export-d1.py` 用那份规则生成，这里必须产出**同样的键**才能命中。
+ * 三处各写一份就是历史上键对不上、查询静默 404 的根因（审查报告 P0-3）。
+ * 改 `cidkey.py` 时务必同步这里。
+ */
 function normalizeCode(code: string): { letters: string; num: number } | null {
   const s = (code || "").trim().toLowerCase().replace(/[-_\s]+/g, "");
   const m = /^(\d*?)([a-z]+?)(\d+)$/.exec(s);

@@ -7,9 +7,12 @@ export-d1.py — 从 dmm-index.db 导出 Cloudflare D1 导入 SQL
 
 与 SQLite 版的关键差异：
   SQLite 存 cid 原文，D1 存「归一化键 (k_letters, k_num)」。
-  原因：实测 620,025 行里 code 字段只有 18% 非空（cid 与番号非一一对应，
-  厂牌带数字前缀如 ABP-888 → 118abp00888），番号查询实际靠归一化。
-  归一化后 620,025 → 292,621 唯一键，D1 体积约 19 MB。
+  原因：实测（2026-10-06 dump，790,311 行）code 字段只有约 18% 非空
+  （cid 与番号非一一对应，厂牌带数字前缀如 ABP-888 → 118abp00888），
+  番号查询实际靠归一化。归一化后 790,311 → 375,134 唯一键（旧规则）。
+
+⚠️ 规则放宽后键数会明显上涨（旧规则漏掉 17.6% 的键，见 cidkey.py），
+   所以下次重建索引库后 D1 需要一次大差集同步，别被行数吓到。
 
 分片：按 k_letters 首字母的 ord % shard_count 切分，保证每片行数可控，
       避免触及免费版 10 万行/天写入上限。
@@ -29,8 +32,9 @@ export-d1.py — 从 dmm-index.db 导出 Cloudflare D1 导入 SQL
 
 import argparse
 import os
-import re
 import sqlite3
+
+from cidkey import cid_key as cid_to_key   # 单一事实来源，见 cidkey.py 的来历说明
 
 D1_SCHEMA = """
 PRAGMA foreign_keys = OFF;
@@ -48,28 +52,17 @@ CREATE TABLE IF NOT EXISTS video (
 ) WITHOUT ROWID;
 """
 
-# cid 形态：[厂牌数字][字母段][数字段][可选尾缀]
-# 例 118abp00888 / ssis00095 / 1STARS00359 / 4ssis095r / h_491fone00062
-CID_KEY_RE = re.compile(r"^(?P<pre>\d*)(?P<letters>[a-z_]+?)(?P<num>\d*)(?P<suf>r|re\d+|c|d)?$")
-
-
-def cid_to_key(cid):
-    """cid → (letters, num)；num 已去前导零。无法归一化返回 None（如 000_035）。"""
-    m = CID_KEY_RE.match((cid or "").lower())
-    if not m:
-        return None
-    letters = m.group("letters").strip("_")
-    num = m.group("num")
-    if not letters or not num:
-        return None
-    stripped = num.lstrip("0")
-    if not stripped:
-        return None
-    return letters, stripped
-
-
 def collect(db_path):
-    """读索引库，按归一化键去重，返回 {key: (cdn, dirpath, stem, quality, variant, fmt, cdn统计)}"""
+    """
+    读索引库，按归一化键去重。
+
+    返回 (best, total, skipped)：
+      best    {key: (prio, cdn, dirpath, stem, quality, variant, fmt)}
+      total   源库行数
+      skipped cid 无法归一化成查询键、被**丢弃**的行数
+              以前这个值从未被统计过 —— 那是 P0-4：24.6% 的行悄悄消失，
+              而 D1 是线上唯一查询路径，等于线上直接少四分之一。
+    """
     conn = sqlite3.connect(db_path)
     db = conn.cursor()
     # 向后兼容：fmt 列是后来加的，从 release 拉到的旧版索引库没有这一列。
@@ -79,10 +72,12 @@ def collect(db_path):
            + ("fmt" if "fmt" in cols else "0") + ", source, code FROM video")
     best = {}
     total = 0
+    skipped = 0
     for cid, cdn, dirpath, stem, q, v, fmt, source, code in db.execute(sql):
         total += 1
         k = cid_to_key(cid)
         if not k:
+            skipped += 1
             continue
         # 破平优先级，与 build-index.py 的 Builder.offer 一致
         prio = (
@@ -95,7 +90,7 @@ def collect(db_path):
         if cur is None or prio < cur[0]:
             best[k] = (prio, cdn, dirpath, stem, q, v, fmt)
     conn.close()
-    return best, total
+    return best, total, skipped
 
 
 def shard_of(letters, shard_count):
@@ -124,10 +119,21 @@ def main():
     ap.add_argument("--shard", type=int, default=0, help="分片序号（从 0 起）")
     ap.add_argument("--shard-count", type=int, default=1, help="分片总数")
     ap.add_argument("--stats", action="store_true", help="只统计各分片行数，不导出")
+    # P0-4：丢弃比例必须可见、可卡。阈值定 15%：
+    #   放宽归一化规则后实测 ~8.3%（剩的是字母-数字-字母这类真·不规则形态），
+    #   而修复前是 24.6% —— 15% 能卡住任何「规则又跑偏」的回归，又不至于天天红。
+    ap.add_argument("--max-skip-ratio", type=float, default=0.15,
+                    help="cid 无法归一化的行占比上限，超过则 exit 1（默认 0.15）")
     args = ap.parse_args()
 
-    best, total = collect(args.input)
-    print(f"源库 {total:,} 行 → 归一化唯一键 {len(best):,}")
+    best, total, skipped = collect(args.input)
+    ratio = skipped / total if total else 0.0
+    print(f"源库 {total:,} 行 → 归一化唯一键 {len(best):,} "
+          f"（丢弃 {skipped:,} 行，{ratio:.2%}）")
+    if ratio > args.max_skip_ratio:
+        print(f"\n::error::丢弃比例 {ratio:.2%} 超过阈值 {args.max_skip_ratio:.2%}。"
+              f"通常是 cidkey.py 的归一化规则又漏了形态，或上游索引口径变了。")
+        raise SystemExit(1)
 
     # 分桶
     shards = {}

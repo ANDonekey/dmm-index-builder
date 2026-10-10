@@ -83,9 +83,15 @@ func TestParseRange(t *testing.T) {
 
 func TestFileQuality(t *testing.T) {
 	cases := map[string]string{
+		// A 形态：{stem}_{quality}_{variant}.mp4
 		"https://cc3001.dmm.co.jp/litevideo/freepv/1/118/118abp888/118abp888_mhb_w.mp4": "mhb",
 		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b_sm_w.mp4":                        "sm",
-		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b.mp4":                             "",
+		// B 形态：{stem}{quality}{variant}.mp4（没有下划线 —— 旧实现在这里返回 ""）
+		"https://cc3001.dmm.co.jp/pv/PTd7ARkWDp2t/1sdjs00383mhb.mp4":   "mhb",
+		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b/abcdmb.mp4":     "dmb",
+		"https://cc3001.dmm.co.jp/pv/tok/1sdjs003834k.mp4":             "4k",
+		// 认不出来的
+		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b.mp4": "",
 	}
 	for in, want := range cases {
 		if got := fileQuality(in); got != want {

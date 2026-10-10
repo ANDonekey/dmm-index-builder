@@ -165,7 +165,12 @@ def sql_str(s):
 
 # ---------- 目标状态：从索引库按归一化键重建 ----------
 def load_target(db_path, ed1):
-    best, total = ed1.collect(db_path)
+    best, total, skipped = ed1.collect(db_path)
+    # 丢弃比例必须可见：export-d1.py 里那句 `if not k: continue` 曾经静默吃掉
+    # 24.6% 的行（审查报告 P0-4），现在 collect() 会把 skipped 报回来。
+    if total:
+        print(f"  索引库 {total:,} 行 → 归一化键 {len(best):,} "
+              f"（丢弃 {skipped:,}，{skipped / total:.2%}）")
     # export-d1.py 的键里 num 是「去前导零后的字符串」，D1 侧是 INTEGER，必须统一
     return {(k[0], int(k[1])): v[1:] for k, v in best.items()}, total
 
@@ -393,21 +398,11 @@ def main():
             files.append({"file": p.name, "statements": len(part)})
             print(f"  {p.name}: {len(part):,} 条")
 
-    manifest = {
-        "index_id": args.index_id,
-        "source_rows": total,
-        "target_keys": len(target),
-        "old_keys": len(old) if old is not None else None,
-        "upsert": len(upsert),
-        "delete": len(delete),
-        "changed": bool(changed),
-        "d1_rows_read": rows_read,
-        "slice": {"skip": start, "end": end, "remaining": remaining,
-                  "this_run": len(u_sel) + len(d_sel)},
-        "chunks": files,
-    }
-
     # ---------- 切片：突破「10 万行/天」写入上限 ----------
+    # ⚠️ 必须先算切片、再构造 manifest：以前这段在 manifest 之后，
+    #    于是 start/end/remaining/u_sel/d_sel 全是未赋值的名字，
+    #    任何走到这里的运行都会 NameError —— D1 增量同步链路曾经整体不可用
+    #    （审查报告 P0-6）。顺序本身即是 bug，别再挪回去。
     # 差集顺序是确定的（upsert 先排、delete 后排，各自按 (k_letters,k_num) 排序），
     # 所以 --skip/--max-write 按一维下标切片可以安全续传：不漏、不重复。
     U, D = len(upsert), len(delete)
@@ -421,6 +416,20 @@ def main():
     if args.skip or args.max_write:
         print(f"\n切片: 总 {total_work:,} 条，本次写第 {start:,}~{end:,} 条 "
               f"(upsert {len(u_sel):,} / delete {len(d_sel):,})，剩 {remaining:,}")
+
+    manifest = {
+        "index_id": args.index_id,
+        "source_rows": total,
+        "target_keys": len(target),
+        "old_keys": len(old) if old is not None else None,
+        "upsert": len(upsert),
+        "delete": len(delete),
+        "changed": bool(changed),
+        "d1_rows_read": rows_read,
+        "slice": {"skip": start, "end": end, "remaining": remaining,
+                  "this_run": len(u_sel) + len(d_sel)},
+        "chunks": files,
+    }
 
     # ---------- 写入 ----------
     if args.apply:

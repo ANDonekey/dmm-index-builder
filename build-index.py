@@ -36,7 +36,8 @@ updated_at     TEXT
 
 ⚠️ URL 不落库：由 build_url(dirpath, stem, quality, variant) 运行时拼装。
    原始 URL 里固定前缀 43 字符、且 stem 出现两次（目录名 + 文件名），冗余极大；
-   分列存储后 62 万条从 82.4 MB 降到约 45 MB。
+   分列存储后体积约为直接存 URL 的六成（62 万条时实测 82.4 MB → 48.6 MB）。
+   2026-10-06 dump 实得 790,311 条。
 """
 
 import argparse
@@ -54,11 +55,15 @@ DUMP_VERSIONS = {
     "r18dotdev_dump_2026-09-29.sql": "2026-09-29",
 }
 
-# freepv 清晰度，由高到低（用于选最优；freepv 天花板是 hhb）
-# ⚠️ 4k 以前不在表里，导致 dump 里 1,803 条 4k/4ks 预览被整类丢弃。
-#    4k 画质高于 hhb，排在它上面。
-QUALITY_RANK = {"4k": 6, "hhb": 5, "mhb": 4, "dmb": 3, "dm": 2, "sm": 1}
-QUALITIES_DESC = ["4k", "hhb", "mhb", "dmb", "dm", "sm"]
+# freepv 清晰度，由高到低（用于选最优）
+#
+# ⚠️ 这张表是**唯一事实来源**：URL 正则里的 quality 候选 `_Q` 由它派生（见下面 _Q）。
+#    以前两处各写一份：正则里认 hmb，而这张表里没有 → offer() 里 `rank is None`
+#    直接 return，173 条 hmb 直链被静默丢弃（`rejected` 计数还从不被打印）。
+#    见审查报告 P0-2。要加档位只改这一行。
+#    hmb = hd、mmb = medium，见 dmm-preview-reference.ts。
+QUALITIES_DESC = ["4k", "hhb", "hmb", "mhb", "mmb", "dmb", "dm", "sm"]
+QUALITY_RANK = {q: len(QUALITIES_DESC) - i for i, q in enumerate(QUALITIES_DESC)}
 
 # 数据源优先级（档位相同时破平用）：trailer 表实测档位普遍更高，且更权威
 SOURCE_RANK = {"sample": 1, "trailer": 2}
@@ -67,6 +72,8 @@ SOURCE_RANK = {"sample": 1, "trailer": 2}
 #   https://{cdn}/litevideo/freepv/{a}/{ab}/{stem}/{stem}_{quality}_{variant}.mp4
 # ⚠️ CDN 主机不止 cc3001：库里还有 pv3001.dmm.co.jp（实测存在，且这批多是 mhb 高档）。
 #    早期只认 cc3001，把 28 条 pv3001 的 mhb 记录误降级成 dmb（校验时发现）。
+# ⚠️ 这张清单必须与 dmm-proxy/config.go 的 ALLOWED_CDN 默认值保持一致：
+#    这边认得的 cdn 会写进索引库，那边不放行就是一律 403（审查报告 P1-6）。
 CDN_HOSTS = ("cc3001", "pv3001", "cc3002", "cc3003")
 
 # dump 里其实并存**两套**预览地址体系，以前只认了第一套，第二套整类丢弃：
@@ -87,8 +94,10 @@ FMT_PV_A = 2       # /pv/{token}/{stem}_{q}_{v}.mp4
 FMT_PV_B = 3       # /pv/{token}/{stem}{q}{v}.mp4
 
 _HOST = r"^https?://(?P<cdn>" + "|".join(CDN_HOSTS) + r")\.dmm\.(?:co\.jp|com)"
-# 文件名里 quality 的候选（长的在前，避免 4k 被 hhb 之类抢匹配）
-_Q = r"(?P<quality>4k|hhb|hmb|mhb|dmb|dm|sm)"
+# 文件名里 quality 的候选。⚠️ 由 QUALITIES_DESC 派生，不要手写 ——
+# 手写的后果是「正则认得、档位表不认得」的档位被静默丢弃（hmb 就是这么丢的）。
+# 长的在前，避免 4k 被 hhb 之类抢匹配。
+_Q = r"(?P<quality>" + "|".join(QUALITIES_DESC) + r")"
 
 FREEPV_RE = re.compile(
     _HOST + r"/litevideo/freepv/"
@@ -128,7 +137,7 @@ PRAGMA temp_store = MEMORY;
 --     https://cc3001.dmm.co.jp/litevideo/freepv/5/531/5314gnbd01156/5314gnbd01156_dmb_w.mp4
 --   其中固定前缀 43 字符 + stem 出现两次（目录名 + 文件名），冗余极大。
 --   因此只存「路径主体 + 清晰度 + 变体」，URL 由 build_url() 运行时拼装。
---   实测 62 万条：82.4 MB → 48.6 MB。
+--   实测（62 万条时）：直接存 URL 82.4 MB → 分列存储 48.6 MB。
 -- ⚠️ stem ≠ cid！目录名里的数字段可能被去前导零（ssni00036 保留零，但
 --    104fsmd00029 → 目录 104fsmd29），所以 stem 必须单独存一列，不能用 cid 代替。
 -- ⚠️ cdn 主机不止 cc3001：库里还有 pv3001.dmm.co.jp（实测，且多是 mhb 高档），
@@ -269,31 +278,39 @@ def cid_to_code(cid):
 # ---------- 核心：流式解析 ----------
 
 class Builder:
-    def __init__(self, conn, batch_size=50_000):
+    def __init__(self, conn, batch_size=50_000, base_quality="sm"):
         self.conn = conn
         self.batch = []
         self.batch_size = batch_size
-        self.stats = {"trailer": 0, "sample": 0, "accepted": 0, "upgraded": 0, "rejected": 0}
+        self.stats = {"trailer": 0, "sample": 0, "accepted": 0, "upgraded": 0}
         self.db = conn.cursor()
+        # --base-quality：低于此档的记录直接不入（P1-3：以前这个开关声明了却从未生效）
+        self.min_rank = QUALITY_RANK[base_quality]
         # 内存字典：cid -> [rank, quality, variant, url, source, size_hint]
         # 78 万条，每条约 200B ≈ 160MB。GitHub Actions 有 7GB 内存，无压力。
         self.best = {}
         self.code_map = {}
-        # 增量刷写集合：只含新增或档位被提升的 cid
-        self.dirty = set()
+        # 增量刷写集合：只含新增或档位被提升的 cid。
+        # 用 dict 而不是 set —— flush() 要按 cid 直接取行，用 set 就退化成全表遍历。
+        self.dirty = {}
 
     def offer(self, cid, parsed, code, source, size_hint=0):
         self.stats[source] = self.stats.get(source, 0) + 1
         dirpath, stem, quality, variant, cdn, fmt = parsed
         rank = QUALITY_RANK.get(quality)
         if rank is None:
-            self.stats["rejected"] += 1
+            # _Q 由 QUALITY_RANK 派生，正常走不到这里。真走到了说明两处又跑偏，
+            # 必须炸出来，绝不能像以前那样 `rejected += 1` 静默丢掉（hmb 之鉴）。
+            raise ValueError(
+                f"未知档位 {quality!r}：_Q 与 QUALITY_RANK 不同源（cid={cid!r}）")
+        if rank < self.min_rank:
+            self.stats["below_base"] = self.stats.get("below_base", 0) + 1
             return
         cur = self.best.get(cid)
         if cur is None:
             self.stats["accepted"] += 1
             self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint, fmt]
-            self.dirty.add(cid)
+            self.dirty[cid] = None
             return
         # 破平规则：先比档位，档位相同再比数据源优先级（trailer 优先于 sample）。
         # ⚠️ 必须整条替换 cdn/dirpath/stem/quality/variant ——同一个 cid 在两表里
@@ -302,33 +319,41 @@ class Builder:
         if rank > cur[0] or (rank == cur[0] and SOURCE_RANK.get(source, 0) > SOURCE_RANK.get(cur[6], 0)):
             self.stats["upgraded"] += 1
             self.best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint, fmt]
-            self.dirty.add(cid)
+            self.dirty[cid] = None
         if code and cid not in self.code_map:
             self.code_map[cid] = code
-            self.dirty.add(cid)
+            self.dirty[cid] = None
 
     def flush(self):
         """
         只把「新增或档位被提升」的 cid 落库（增量刷写）。
         早期版本每 5 万条就把整个字典重写一遍 → O(n²/batch)，78 万条会慢到十几分钟。
         改成只写 dirty 集合后，写库次数从 ~16 次 × 78 万降到 1 次 × 变更条数。
+
+        ⚠️ dirty 必须是 dict 而不是 set：以前写成
+           ``(... for cid, v in self.best.items() if cid in self.dirty)``
+           看着像「只遍历 dirty」，实际仍是 O(全表)（实测 21 次 × 78.8 万 ≈ 1600 万次迭代）。
         """
         if not self.dirty:
             return
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # best[cid] = [rank, cdn, dirpath, stem, quality, variant, source, size_hint]
-        self.db.executemany(
-            "INSERT OR REPLACE INTO video"
-            "(cid,code,cdn,dirpath,stem,quality,variant,fmt,size_hint,source,"
-            "verified,verified_bytes,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?)",
-            (
-                (cid, self.code_map.get(cid) or cid_to_code(cid),
-                 v[1], v[2], v[3], v[4], v[5], v[8], v[7], v[6], now)
-                for cid, v in self.best.items() if cid in self.dirty
-            ),
-        )
-        self.conn.commit()
+        rows = []
+        for cid in self.dirty:
+            v = self.best.get(cid)
+            if v is None:
+                continue
+            rows.append((cid, self.code_map.get(cid) or cid_to_code(cid),
+                         v[1], v[2], v[3], v[4], v[5], v[8], v[7], v[6], now))
+        if rows:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO video"
+                "(cid,code,cdn,dirpath,stem,quality,variant,fmt,size_hint,source,"
+                "verified,verified_bytes,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?)",
+                rows,
+            )
+            self.conn.commit()
         self.stats["flushed"] = self.stats.get("flushed", 0) + len(self.dirty)
         self.dirty.clear()
 
@@ -342,6 +367,8 @@ class Builder:
         避免对 1.3 GB 做逐行 Python 循环（那是分钟级开销）。
         """
         t0 = time.time()
+        # --base-quality 在这里真正生效（P1-3：以前只是传进来，然后被扔掉）
+        self.min_rank = QUALITY_RANK[base_quality]
         path = dump_path
         if path == "-":
             raise SystemExit("stdin 模式暂不支持块定位，请传文件路径")
@@ -449,7 +476,9 @@ class Builder:
                         self.flush()
                         self._progress(count, t0)
             if tail.strip():
-                pass
+                # 以前这里是 `pass` —— 最后一行不完整时直接静默丢掉（P1-2）。
+                # 现在计数上报；正常数据下应为 0（span 结束于行首 `\.`，尾行必带 \n）。
+                self.stats["tail_residue"] = self.stats.get("tail_residue", 0) + 1
         return count
 
     def _progress(self, lines, t0, final=False):
@@ -516,6 +545,10 @@ def main():
           f"sample 表贡献 {b.stats.get('sample', 0):,} 条")
     if b.stats.get("upgraded"):
         print(f"  升档覆盖 {b.stats['upgraded']:,} 条（trailer 表档位更高）")
+    if b.stats.get("below_base"):
+        print(f"  低于 --base-quality {args.base_quality} 被排除 {b.stats['below_base']:,} 条")
+    if b.stats.get("tail_residue"):
+        print(f"  ⚠ 尾部残留行 {b.stats['tail_residue']:,} 段（span 切分不完整，需检查 dump 完整性）")
 
     # 档位分布
     db = conn.cursor()

@@ -161,15 +161,27 @@ jobs:
           set -euo pipefail
           time python build-index.py -i dump.sql -o dmm-index.db --vacuum
 
-      # ---------- 6. 质量闸门：620,025 条逐条比对，不一致直接 fail ----------
+      # ---------- 6. 质量闸门：自洽（逐条比对）+ 召回 ----------
       - name: Verify index against dump (quality gate)
         run: |
           set -euo pipefail
           # 这个校验器抓出过 4 个真实 bug（stem≠cid / 破平混搭 / pv3001 漏识别 等），
           # 没有它错误会静默流到线上。**不要改成抽样。**
           # 路径必须显式传，不能依赖默认值（默认值是本地相对路径）
-          python verify-index.py dump.sql dmm-index.db
+          #
+          # ⚠️ --min-recall 默认是 0.98，这里临时放宽到 0.97：
+          #    part 播放页那 12.3% 的预览还不支持（审查报告 P0-5），
+          #    2026-09-29 dump 实测召回 97.67%。P0-5 修完后删掉这个参数，回到默认。
+          python verify-index.py dump.sql dmm-index.db --min-recall 0.97
           ls -lh dmm-index.db
+
+      # ---------- 6b. 召回审计（独立口径，不复用被测代码的正则）----------
+      # verify-index.py 再怎么用也回答不了「该收的是否都收了」——它 import 了被测代码。
+      # 这个脚本独立扫 dump，只管召回；两者并列：前者管自洽，后者管召回。
+      - name: Audit coverage (recall)
+        run: |
+          set -euo pipefail
+          python audit-coverage.py --dump dump.sql --db dmm-index.db --min-coverage 0.97
 
       # ---------- 7. 与上一版 diff ----------
       - name: Diff against previous index

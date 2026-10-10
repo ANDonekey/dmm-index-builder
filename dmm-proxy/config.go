@@ -178,7 +178,10 @@ func LoadConfig() (*Config, error) {
 
 	c.AllowedCDN = envSet("ALLOWED_CDN")
 	if len(c.AllowedCDN) == 0 {
-		c.AllowedCDN = map[string]bool{"cc3001": true, "pv3001": true}
+		// ⚠️ 必须与 build-index.py 的 CDN_HOSTS 保持一致：那边认得、这边不放行，
+		//    结果就是索引库里有一批行、反代对它们一律 403（审查报告 P1-6）。
+		//    改一边就要改另一边，两边都写了这条注释互相指向。
+		c.AllowedCDN = map[string]bool{"cc3001": true, "pv3001": true, "cc3002": true, "cc3003": true}
 	}
 
 	raw := envStr("UPSTREAM_PROXY", "socks5://127.0.0.1:1080")

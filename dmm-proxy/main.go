@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -555,18 +556,34 @@ func (s *Server) allowCache(upstream string) bool {
 	return s.cfg.CacheQualityAllow[fileQuality(upstream)]
 }
 
-// fileQuality 从 {stem}_{quality}_{variant}.mp4 里取 quality。
+// qualityInFile 匹配文件名尾部的「档位 + 可选变体 + .mp4」。
+// 档位清单必须与 build-index.py 的 QUALITIES_DESC 保持一致（否则档位白名单会漏判）。
+var qualityInFile = regexp.MustCompile(`(4k|hhb|hmb|mhb|mmb|dmb|dm|sm)[ws]?\.mp4$`)
+
+// fileQuality 从文件名里取 quality，A/B 两种命名都要认：
+//
+//	A: {stem}_{quality}_{variant}.mp4   例 1sdjs206_mhb_w.mp4
+//	B: {stem}{quality}{variant}.mp4     例 1sdjs00383mhb.mp4（variant 可缺省）
+//
+// ⚠️ 旧实现只会 split("_")，B 形态没有下划线 → 一律返回 ""。
+//
+//	一旦部署时设了 CACHE_QUALITY_ALLOW 白名单，所有 B 形态（含 pv 新体系的一部分）
+//	都会被判成「不可缓存」→ 每次都回源，直接烧节点流量（审查报告 P1-5）。
 func fileQuality(p string) string {
 	base := p
 	if i := strings.LastIndex(base, "/"); i >= 0 {
 		base = base[i+1:]
 	}
-	base = strings.TrimSuffix(base, ".mp4")
-	parts := strings.Split(base, "_")
-	if len(parts) < 3 {
-		return ""
+	base = strings.ToLower(base)
+	if m := qualityInFile.FindStringSubmatch(base); m != nil {
+		return m[1]
 	}
-	return strings.ToLower(parts[len(parts)-2])
+	// 兜底：A 形态（下划线分隔）里可能出现清单外的写法，取倒数第二段
+	parts := strings.Split(strings.TrimSuffix(base, ".mp4"), "_")
+	if len(parts) >= 3 {
+		return parts[len(parts)-2]
+	}
+	return ""
 }
 
 // ─────────────────────────── 辅助 writer ───────────────────────────

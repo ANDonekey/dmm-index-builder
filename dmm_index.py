@@ -2,7 +2,7 @@
 DMM 索引库查询辅助。
 
 ⚠️ 为什么不能直接 `WHERE code = 'ABP-888'`：
-   索引库里的 `code` 只有 111,484 / 620,025（18%）非空，因为 DMM 的
+   索引库里的 `code` 只有约 18% 非空（2026-10-06 dump：790,311 行），因为 DMM 的
    content_id 与「番号」不是一一对应：
 
      - 厂牌带数字前缀：ABP-888  → cid `118abp00888`（118=动画厂牌码）
@@ -10,6 +10,10 @@ DMM 索引库查询辅助。
      - 不规则：h_491fone00062、000_035、1STARS00359、4ssis095 …
 
    所以正确做法是**归一化后比对「字母段 + 数字段」**，而不是字符串相等。
+
+归一化规则集中在 `cidkey.py`（`dmm_index.py` / `export-d1.py` / `worker/index.ts`
+三处共用一份）。⚠️ 旧规则漏掉 17.6% 的键（`118tre00024` 这类解析不出来），
+详见 `审查报告-预览视频抽取完整性.md` 的 P0-3。
 
 匹配规则（优先级从高到低）：
 
@@ -20,49 +24,10 @@ DMM 索引库查询辅助。
 批量查询请用 `lookup_many()`——一次全表扫描服务所有番号。
 """
 
-import re
 import sqlite3
 
-# cid 形态： [厂牌数字][字母段][数字段][可选后缀]
-# 例：118abp00888 / ssis00095 / 1STARS00359 / 4ssis095r / 000_035 / h_491fone00062
-_CID_RE = re.compile(r"^(?P<pre>\d*)(?P<letters>[a-z_]+?)(?P<num>\d*)(?P<suf>r|re\d+|c|d)?$")
-# 番号形态： ABC-123 / ABC123 / 118abc-123
-# 先剥掉连字符再匹配，避免「字母段非贪婪 + 可选连字符」把连字符吃进字母段
-_CODE_RE = re.compile(r"^(?P<pre>\d*)(?P<letters>[a-z]+?)(?P<num>\d+)$")
-
-
-def normalize_code(code: str):
-    """番号 → (字母段小写, 数字段去零)。解析失败返回 None。"""
-    s = (code or "").strip().lower()
-    if not s:
-        return None
-    # 去掉所有连字符与空格（ABP-888 / abp 888 / ABP888 都等价）
-    s = re.sub(r"[-_\s]+", "", s)
-    m = _CODE_RE.match(s)
-    if not m:
-        return None
-    letters, num = m.group("letters"), m.group("num")
-    if not letters or not num:
-        return None
-    return letters, num.lstrip("0") or "0"
-
-
-def _cid_key(cid: str):
-    """
-    cid → (字母段, 数字段去零, 完整字母段)
-
-    完整字母段用于「扩展匹配」：如 1STAR / 1STARS 这类，
-    库里 cid 是 1STARS00359（完整段 'stars'），而番号写作 STAR-359。
-    """
-    m = _CID_RE.match((cid or "").lower())
-    if not m:
-        return None
-    letters = m.group("letters").strip("_")
-    num = m.group("num")
-    if not letters:
-        return None
-    return letters, num.lstrip("0"), m.group("letters")
-
+from cidkey import cid_key_full as _cid_key   # 单一事实来源，见 cidkey.py
+from cidkey import code_key as normalize_code
 
 class Index:
     def __init__(self, db_path: str, cache_size: int = 20000):
