@@ -125,8 +125,11 @@ class Index:
     def _row_by_cid(self, cid: str):
         if cid in self._cache:
             return self._cache[cid]
+        # ⚠️ fmt 必须取：漏了它 build_url 会恒按 fmt=0 拼，
+        #    把 pv 新体系的 62 位 token 塞进 freepv 路径并强套 A 形态下划线 → 必然 404
+        #    （92,513 行受影响，表现为「能搜到但播不了」。详见审查报告补充章节 新发现 B）
         r = self.conn.execute(
-            "SELECT cid, code, cdn, dirpath, stem, quality, variant, source, "
+            "SELECT cid, code, cdn, dirpath, stem, quality, variant, fmt, source, "
             "       verified, verified_bytes FROM video WHERE cid = ?",
             (cid,),
         ).fetchone()
@@ -142,7 +145,8 @@ class Index:
             "code": r["code"],
             "quality": f"{r['quality']}_{r['variant']}",
             "source": r["source"],
-            "url": Index.build_url(r["cdn"], r["dirpath"], r["stem"], r["quality"], r["variant"]),
+            "url": Index.build_url(r["cdn"], r["dirpath"], r["stem"],
+                                   r["quality"], r["variant"], r["fmt"]),
             "verified": bool(r["verified"]),
             "verified_bytes": r["verified_bytes"],
         }
