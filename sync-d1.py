@@ -262,8 +262,14 @@ def download_prev_index(index_id, dest_dir):
     d = pathlib.Path(dest_dir)
     d.mkdir(parents=True, exist_ok=True)
     print(f"下载旧索引库 release {tag} ...", flush=True)
+    # ⚠️ 参数是 -D（--dir 目录），不是 -O（--output 单个文件）。
+    #    以前写成 -O <目录>：老版本 gh 勉强能过，新版把目录当输出文件处理，
+    #    先报 "<dir> already exists"、加了 --clobber 又报 "open <dir>: is a directory"。
+    #    （2026-10-13 的定时构建就是这样挂的，D1 同步整步失败。）
+    # --clobber 也不能省：上面 mkdir 已经把目录建出来了，gh 默认拒绝写入已存在目录。
     p = subprocess.run(
-        ["gh", "release", "download", tag, "-p", "dmm-index.db", "-O", str(d)],
+        ["gh", "release", "download", tag, "-p", "dmm-index.db",
+         "-D", str(d), "--clobber"],
         capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         die(f"下载 {tag} 失败: {(p.stderr or p.stdout)[:300]}")
