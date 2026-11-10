@@ -24,8 +24,8 @@ func TestNormalizeCode(t *testing.T) {
 		{"118tre00024", "tre", 24, true}, // 旧非贪婪正则的经典漏收案例
 		{"ABC-123", "abc", 123, true},
 		{"", "", 0, false},
-		{"ABC", "", 0, false},   // 没有数字段
-		{"123", "", 0, false},   // 没有字母段
+		{"ABC", "", 0, false}, // 没有数字段
+		{"123", "", 0, false}, // 没有字母段
 		{"ABC-", "", 0, false},
 	}
 	for _, c := range cases {
@@ -86,5 +86,40 @@ func TestNoMirrorOmitsFallback(t *testing.T) {
 	}
 	if _, ok := out["hlsUrl"]; ok {
 		t.Error("MIRROR_HOST 为空时不应有 hlsUrl")
+	}
+	for _, u := range out["urls"].([]map[string]string) {
+		if u["via"] == "mirror" {
+			t.Error("MIRROR_HOST 为空时 urls 里不应有 mirror 候选")
+		}
+	}
+}
+
+// 候选顺序决定客户端先打谁：镜像优先 = 省反代配额，反代优先 = 图稳定。
+func TestURLPriority(t *testing.T) {
+	row := Row{cid: "118abp00888", cdn: "cc3001", dirpath: "1/118/118abp888",
+		stem: "118abp888", quality: "mhb", variant: "w"}
+
+	mirrorFirst := &Server{cfg: Config{ProxyHost: "p", MirrorHost: "m", MirrorProxy: true, MirrorFirst: true}}
+	urls := mirrorFirst.build(row, "ABP-888")["urls"].([]map[string]string)
+	want := []string{"mirror_proxy", "mirror_proxy", "mirror_direct", "mirror_direct", "proxy", "direct"}
+	if len(urls) != len(want) {
+		t.Fatalf("urls 数量 %d，期望 %d", len(urls), len(want))
+	}
+	for i, w := range want {
+		if urls[i]["via"] != w {
+			t.Errorf("第 %d 个候选 via=%q，期望 %q", i, urls[i]["via"], w)
+		}
+	}
+	if urls[0]["type"] != "mp4" || urls[1]["type"] != "hls" {
+		t.Error("镜像候选应先 mp4 后 hls")
+	}
+
+	proxyFirst := &Server{cfg: Config{ProxyHost: "p", MirrorHost: "m", MirrorProxy: true, MirrorFirst: false}}
+	urls2 := proxyFirst.build(row, "ABP-888")["urls"].([]map[string]string)
+	if urls2[0]["via"] != "proxy" {
+		t.Errorf("反代优先时首个候选应为 proxy，实际 %q", urls2[0]["via"])
+	}
+	if urls2[len(urls2)-1]["via"] != "mirror_direct" {
+		t.Errorf("反代优先时镜像应排最后，实际 %q", urls2[len(urls2)-1]["via"])
 	}
 }

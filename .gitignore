@@ -56,6 +56,8 @@ D1-*.md
 dmm-proxy/*.exe
 dmm-query/*.exe
 dmm-query/dist/
+dmm-mirror/*.exe
+dmm-mirror/dist/
 
 # 待灌库的差集分片（用完即删）
 d1-pending/

@@ -1,0 +1,28 @@
+[Unit]
+Description=javtrailers 镜像反代（uTLS 回源，缓存交给 Cloudflare）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmmpv
+Group=dmmpv
+EnvironmentFile=-/etc/dmm-mirror.env
+ExecStart=/opt/dmm-mirror/dmm-mirror
+Restart=always
+RestartSec=3
+
+# 纯流式透传，不落盘：内存只是 32KB 缓冲 + TLS 状态
+MemoryMax=256M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadOnlyPaths=/opt/dmm-mirror
+
+[Install]
+WantedBy=multi-user.target
