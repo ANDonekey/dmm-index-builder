@@ -87,9 +87,9 @@ func TestFileQuality(t *testing.T) {
 		"https://cc3001.dmm.co.jp/litevideo/freepv/1/118/118abp888/118abp888_mhb_w.mp4": "mhb",
 		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b_sm_w.mp4":                        "sm",
 		// B 形态：{stem}{quality}{variant}.mp4（没有下划线 —— 旧实现在这里返回 ""）
-		"https://cc3001.dmm.co.jp/pv/PTd7ARkWDp2t/1sdjs00383mhb.mp4":   "mhb",
-		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b/abcdmb.mp4":     "dmb",
-		"https://cc3001.dmm.co.jp/pv/tok/1sdjs003834k.mp4":             "4k",
+		"https://cc3001.dmm.co.jp/pv/PTd7ARkWDp2t/1sdjs00383mhb.mp4": "mhb",
+		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b/abcdmb.mp4":   "dmb",
+		"https://cc3001.dmm.co.jp/pv/tok/1sdjs003834k.mp4":           "4k",
 		// 认不出来的
 		"https://cc3001.dmm.co.jp/litevideo/freepv/a/b.mp4": "",
 	}

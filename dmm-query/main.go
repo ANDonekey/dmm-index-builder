@@ -46,7 +46,8 @@ import (
 type Config struct {
 	Listen      string // 默认 127.0.0.1:8090
 	DBPath      string
-	ProxyHost   string // 自建反代域名后缀，拼 <cdn>.<ProxyHost>
+	PublicHost  string // 固定对外域名（如 cc3001.fastcdn.dpdns.org），优先使用
+	ProxyHost   string // 兜底：PUBLIC_HOST 为空时拼 <cdn>.<ProxyHost>
 	MirrorProxy bool   // true = 包含「走自己反代」的镜像候选（CF 边缘缓存）
 	MirrorFirst bool   // true = urls 里镜像排前面（省日本出口配额），false = 反代优先
 	CacheKiB    int    // SQLite page cache，默认 16384 KiB
@@ -63,6 +64,7 @@ func loadConfig() Config {
 	c := Config{
 		Listen:      env("LISTEN", "127.0.0.1:8090"),
 		DBPath:      env("DB_PATH", "/var/lib/dmmpv/dmm-index.db"),
+		PublicHost:  env("PUBLIC_HOST", "cc3001.fastcdn.dpdns.org"),
 		ProxyHost:   env("PROXY_HOST", "fastcdn.dpdns.org"),
 		MirrorProxy: env("MIRROR_PROXY", "1") != "0",
 		MirrorFirst: env("MIRROR_FIRST", "1") != "0",
@@ -170,6 +172,27 @@ func (s *Server) lookup(code string) (map[string]any, int) {
 	return s.build(r, code), http.StatusOK
 }
 
+// publicBase 返回对外域名。
+//
+// 纯透传之后，URL 里再按 cdn 变子域只是维护负担（每多一个 cdn 就要加 DNS、
+// 加 nginx server_name、扩证书 SAN）。所以统一固定成一个域名，
+// 真实 cdn 改由 query 参数传递（见 cdnQuery）。
+func (s *Server) publicBase(cdn string) string {
+	if s.cfg.PublicHost != "" {
+		return "https://" + s.cfg.PublicHost
+	}
+	return "https://" + cdn + "." + s.cfg.ProxyHost
+}
+
+// cdnQuery 只有非默认 cdn 才带参数，让 99.99% 的 URL 保持干净。
+// 注意它会进 CF 的缓存键 —— 不同 cdn 天然分开缓存，不会串。
+func cdnQuery(cdn string) string {
+	if cdn == "" || cdn == "cc3001" {
+		return ""
+	}
+	return "?cdn=" + cdn
+}
+
 func (s *Server) build(r Row, code string) map[string]any {
 	// fmt：0/1 → /litevideo/freepv，2/3 → /pv；偶数带下划线，奇数不带
 	file := r.stem + "_" + r.quality + "_" + r.variant + ".mp4"
@@ -183,7 +206,8 @@ func (s *Server) build(r Row, code string) map[string]any {
 	path := prefix + r.dirpath + "/" + file
 
 	dmmURL := "https://" + r.cdn + ".dmm.co.jp" + path
-	proxyURL := "https://" + r.cdn + "." + s.cfg.ProxyHost + path
+	base := s.publicBase(r.cdn)
+	proxyURL := base + path + cdnQuery(r.cdn)
 
 	out := map[string]any{
 		"code":     code,
@@ -206,13 +230,14 @@ func (s *Server) build(r Row, code string) map[string]any {
 	var mirrorProxyMP4, mirrorProxyHLS string
 	if s.cfg.MirrorProxy {
 		if strings.HasPrefix(path, "/litevideo/freepv/") {
-			mirrorProxyMP4 = "https://" + r.cdn + "." + s.cfg.ProxyHost + "/mirror" + path
+			// mirror 的上游固定是 javtrailers，不需要 cdn 参数
+			mirrorProxyMP4 = base + "/mirror" + path
 		}
 		// HLS 体系的目录用**完整 cid** 作 stem，不是 litevideo 那个去零 stem。
 		// 例：ksbj141 的 mp4 在 k/ksb/ksbj141/，HLS 在 k/ksb/ksbj00141/playlist.m3u8
 		// DMM 路径全小写，而库里 cid 可能带大写（1STARS00359），必须转小写
 		if i := strings.LastIndex(r.dirpath, "/"); i > 0 {
-			mirrorProxyHLS = "https://" + r.cdn + "." + s.cfg.ProxyHost + "/mirror/hlsvideo/freepv/" +
+			mirrorProxyHLS = base + "/mirror/hlsvideo/freepv/" +
 				r.dirpath[:i] + "/" + strings.ToLower(r.cid) + "/playlist.m3u8"
 		}
 	}

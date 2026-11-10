@@ -21,8 +21,8 @@ type Config struct {
 	// 路径白名单。原来是单个 /litevideo/freepv/，但 DMM 后来换了新体系：
 	// /pv/<62位随机token>/<文件名>.mp4 —— 那 9 万条预览走旧前缀会被整类 403。
 	// 两个前缀都必须放行，且上游路径是原样拼接的，所以前缀是什么就回源什么。
-	PathPrefixes []string
-	UpstreamScheme string          // https
+	PathPrefixes   []string
+	UpstreamScheme string // https
 
 	// —— 上游代理 ——
 	ProxyURL *url.URL // socks5://127.0.0.1:1080（sing-box，dmm.co.jp 已分流到 jp-group）
@@ -148,7 +148,7 @@ func LoadConfig() (*Config, error) {
 		HostSuffix:     envStr("HOST_SUFFIX", ""),
 		UpstreamSuffix: envStr("UPSTREAM_SUFFIX", ".dmm.co.jp"),
 		// 兼容旧的 PATH_PREFIX（单值）。新部署请用 PATH_PREFIXES（逗号分隔）。
-		PathPrefixes: envPathPrefixes(),
+		PathPrefixes:   envPathPrefixes(),
 		UpstreamScheme: envStr("UPSTREAM_SCHEME", "https"),
 
 		UA:             envStr("UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),

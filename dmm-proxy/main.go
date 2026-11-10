@@ -174,7 +174,7 @@ func (s *Server) resolve(r *http.Request) (upstream string, ok bool) {
 		}
 	}
 
-	// Host：必须是 <cdn>.<HOST_SUFFIX>，且 cdn 在白名单内
+	// Host：必须落在 HOST_SUFFIX 下（防别的域蹭，也防 DNS rebinding）
 	host := strings.ToLower(r.Host)
 	if i := strings.Index(host, ":"); i >= 0 {
 		host = host[:i]
@@ -183,9 +183,21 @@ func (s *Server) resolve(r *http.Request) (upstream string, ok bool) {
 	if host != suffix && !strings.HasSuffix(host, "."+suffix) {
 		return "", false
 	}
-	cdn := host
-	if i := strings.Index(host, "."); i >= 0 {
-		cdn = host[:i]
+
+	// cdn：优先 ?cdn= 参数；没有就退回 Host 的 <cdn> 前缀（兼容旧 URL）；
+	// 再没有就用默认 cc3001。
+	//
+	// 纯透传之后对外域名固定成一个（cc3001.fastcdn.dpdns.org），不再按 cdn 变子域
+	// —— 否则每多一个 cdn 就要加 DNS、nginx server_name、扩证书 SAN。
+	// 但上游仍是 <cdn>.dmm.co.jp，这个信息只能靠参数传进来。
+	cdn := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("cdn")))
+	if cdn == "" && host != suffix {
+		if i := strings.Index(host, "."); i >= 0 {
+			cdn = host[:i]
+		}
+	}
+	if cdn == "" {
+		cdn = "cc3001"
 	}
 	if !cfg.AllowedCDN[cdn] {
 		return "", false
