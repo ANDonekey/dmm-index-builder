@@ -47,7 +47,6 @@ type Config struct {
 	Listen      string // 默认 127.0.0.1:8090
 	DBPath      string
 	ProxyHost   string // 自建反代域名后缀，拼 <cdn>.<ProxyHost>
-	MirrorHost  string // 镜像站，空则不下发镜像候选
 	MirrorProxy bool   // true = 包含「走自己反代」的镜像候选（CF 边缘缓存）
 	MirrorFirst bool   // true = urls 里镜像排前面（省日本出口配额），false = 反代优先
 	CacheKiB    int    // SQLite page cache，默认 16384 KiB
@@ -65,7 +64,6 @@ func loadConfig() Config {
 		Listen:      env("LISTEN", "127.0.0.1:8090"),
 		DBPath:      env("DB_PATH", "/var/lib/dmmpv/dmm-index.db"),
 		ProxyHost:   env("PROXY_HOST", "fastcdn.dpdns.org"),
-		MirrorHost:  env("MIRROR_HOST", "media.javtrailers.com"),
 		MirrorProxy: env("MIRROR_PROXY", "1") != "0",
 		MirrorFirst: env("MIRROR_FIRST", "1") != "0",
 		CacheKiB:    16384,
@@ -196,32 +194,23 @@ func (s *Server) build(r Row, code string) map[string]any {
 		"proxyUrl": proxyURL,
 	}
 
-	var mirrorMP4, mirrorHLS string
-	if s.cfg.MirrorHost != "" {
-		mirrorMP4 = "https://" + s.cfg.MirrorHost + path
-		// HLS 体系的目录用**完整 cid** 作 stem，不是 litevideo 那个去零 stem。
-		// 例：ksbj141 的 mp4 在 k/ksb/ksbj141/，HLS 在 k/ksb/ksbj00141/playlist.m3u8
-		// DMM 路径全小写，而库里 cid 可能带大写（1STARS00359），必须转小写
-		if i := strings.LastIndex(r.dirpath, "/"); i > 0 {
-			mirrorHLS = "https://" + s.cfg.MirrorHost + "/hlsvideo/freepv/" +
-				r.dirpath[:i] + "/" + strings.ToLower(r.cid) + "/playlist.m3u8"
-		}
-		out["fallbackUrl"] = mirrorMP4
-		if mirrorHLS != "" {
-			out["hlsUrl"] = mirrorHLS
-		}
-	}
-
-	// 走自己反代的镜像地址：CF 边缘缓存一年，比客户端直连更稳
-	// （客户端可能被 CF 的 Bot Fight 挑战，反代用 uTLS 指纹回源不受影响）。
+	// 走自己反代的镜像地址：CF 边缘缓存一年，且回源由 dmm-mirror 用 uTLS 指纹完成，
+	// 不受 Bot Fight 影响。
 	//
-	// ⚠️ 只对 litevideo 体系生成：/pv/ 新体系的片在镜像站上基本没有对应资源，
+	// ⚠️ 不生成「客户端直连 javtrailers」的候选：前端去拉 media.javatrailers.com
+	//    会被 CF 的 Bot Fight 直接拒绝（浏览器能过，但 fetch/XHR + 跨域 Referer 过不去）。
+	//    所以镜像只有「经我们反代」这一条路。
+	//
+	// ⚠️ 只对 litevideo 体系生成 mp4：/pv/ 新体系的片在镜像站上基本没有对应资源，
 	//    拼出来也是 404，不如不生成，让客户端直接落到 proxy。
 	var mirrorProxyMP4, mirrorProxyHLS string
 	if s.cfg.MirrorProxy {
 		if strings.HasPrefix(path, "/litevideo/freepv/") {
 			mirrorProxyMP4 = "https://" + r.cdn + "." + s.cfg.ProxyHost + "/mirror" + path
 		}
+		// HLS 体系的目录用**完整 cid** 作 stem，不是 litevideo 那个去零 stem。
+		// 例：ksbj141 的 mp4 在 k/ksb/ksbj141/，HLS 在 k/ksb/ksbj00141/playlist.m3u8
+		// DMM 路径全小写，而库里 cid 可能带大写（1STARS00359），必须转小写
 		if i := strings.LastIndex(r.dirpath, "/"); i > 0 {
 			mirrorProxyHLS = "https://" + r.cdn + "." + s.cfg.ProxyHost + "/mirror/hlsvideo/freepv/" +
 				r.dirpath[:i] + "/" + strings.ToLower(r.cid) + "/playlist.m3u8"
@@ -238,10 +227,9 @@ func (s *Server) build(r Row, code string) map[string]any {
 	// 让客户端试一次。所以「优先镜像」做成**排序优先**。
 	//
 	// via 的取值：
-	//   mirror_proxy  — 走自己的反代，CF 边缘缓存，不消耗日本出口配额
-	//   mirror_direct — 客户端直连 javtrailers，不占 VPS 带宽，但可能被 CF 挑战
-	//   proxy         — 自建 DMM 反代，走日本出口，吃日/月配额
-	//   direct        — DMM 源站，仅日本 IP 可用
+	//   mirror_proxy — 走自己的反代，CF 边缘缓存，不消耗日本出口配额
+	//   proxy        — 自建 DMM 反代，走日本出口，吃日/月配额
+	//   direct       — DMM 源站，仅日本 IP 可用
 	var urls []map[string]string
 	add := func(u, typ, via string) {
 		if u != "" {
@@ -251,16 +239,12 @@ func (s *Server) build(r Row, code string) map[string]any {
 	if s.cfg.MirrorFirst {
 		add(mirrorProxyMP4, "mp4", "mirror_proxy")
 		add(mirrorProxyHLS, "hls", "mirror_proxy")
-		add(mirrorMP4, "mp4", "mirror_direct")
-		add(mirrorHLS, "hls", "mirror_direct")
 	}
 	add(proxyURL, "mp4", "proxy")
 	add(dmmURL, "mp4", "direct")
 	if !s.cfg.MirrorFirst {
 		add(mirrorProxyMP4, "mp4", "mirror_proxy")
 		add(mirrorProxyHLS, "hls", "mirror_proxy")
-		add(mirrorMP4, "mp4", "mirror_direct")
-		add(mirrorHLS, "hls", "mirror_direct")
 	}
 	out["urls"] = urls
 	return out

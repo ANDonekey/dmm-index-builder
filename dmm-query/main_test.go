@@ -40,7 +40,7 @@ func TestNormalizeCode(t *testing.T) {
 // fmt 决定路径前缀与下划线形态，四种组合都要覆盖 ——
 // 历史上漏掉 fmt 导致 pv 新体系 9 万条「能搜到但播不了」。
 func TestBuildPaths(t *testing.T) {
-	s := &Server{cfg: Config{ProxyHost: "fastcdn.dpdns.org", MirrorHost: "media.javatrailers.com"}}
+	s := &Server{cfg: Config{ProxyHost: "fastcdn.dpdns.org"}}
 	cases := []struct {
 		fmt      int
 		wantPath string
@@ -65,31 +65,33 @@ func TestBuildPaths(t *testing.T) {
 
 // HLS 的目录用完整 cid（小写），不是 mp4 那个去零 stem。
 func TestHlsUrlUsesFullCid(t *testing.T) {
-	s := &Server{cfg: Config{ProxyHost: "x", MirrorHost: "media.javatrailers.com"}}
+	s := &Server{cfg: Config{ProxyHost: "x", MirrorProxy: true, MirrorFirst: true}}
 	r := Row{cid: "1STARS00359", cdn: "cc3001", dirpath: "1/1st/1stars359",
 		stem: "1stars359", quality: "mhb", variant: "w"}
-	hls := s.build(r, "STAR-359")["hlsUrl"].(string)
-	want := "https://media.javatrailers.com/hlsvideo/freepv/1/1st/1stars00359/playlist.m3u8"
+	var hls string
+	for _, u := range s.build(r, "STAR-359")["urls"].([]map[string]string) {
+		if u["type"] == "hls" {
+			hls = u["url"]
+		}
+	}
+	want := "https://cc3001.x/mirror/hlsvideo/freepv/1/1st/1stars00359/playlist.m3u8"
 	if hls != want {
-		t.Errorf("hlsUrl = %q，期望 %q", hls, want)
+		t.Errorf("hls 候选 = %q，期望 %q", hls, want)
 	}
 }
 
-// 没配镜像时不应下发试探型字段，避免客户端去打一个不存在的域名
-func TestNoMirrorOmitsFallback(t *testing.T) {
-	s := &Server{cfg: Config{ProxyHost: "x"}}
+// 关掉镜像反代时，不应下发任何镜像候选 —— 客户端只能走 proxy / direct
+func TestNoMirrorProxyOmitsMirror(t *testing.T) {
+	s := &Server{cfg: Config{ProxyHost: "x"}} // MirrorProxy 零值 false
 	r := Row{cid: "ssis00095", cdn: "cc3001", dirpath: "s/ssi/ssis00095",
 		stem: "ssis00095", quality: "mhb", variant: "w"}
 	out := s.build(r, "SSIS-095")
-	if _, ok := out["fallbackUrl"]; ok {
-		t.Error("MIRROR_HOST 为空时不应有 fallbackUrl")
-	}
-	if _, ok := out["hlsUrl"]; ok {
-		t.Error("MIRROR_HOST 为空时不应有 hlsUrl")
+	if _, ok := out["mirrorProxyUrl"]; ok {
+		t.Error("MIRROR_PROXY 关闭时不应有 mirrorProxyUrl")
 	}
 	for _, u := range out["urls"].([]map[string]string) {
-		if u["via"] == "mirror" {
-			t.Error("MIRROR_HOST 为空时 urls 里不应有 mirror 候选")
+		if u["via"] == "mirror_proxy" {
+			t.Error("MIRROR_PROXY 关闭时 urls 里不应有镜像候选")
 		}
 	}
 }
@@ -99,9 +101,9 @@ func TestURLPriority(t *testing.T) {
 	row := Row{cid: "118abp00888", cdn: "cc3001", dirpath: "1/118/118abp888",
 		stem: "118abp888", quality: "mhb", variant: "w"}
 
-	mirrorFirst := &Server{cfg: Config{ProxyHost: "p", MirrorHost: "m", MirrorProxy: true, MirrorFirst: true}}
+	mirrorFirst := &Server{cfg: Config{ProxyHost: "p", MirrorProxy: true, MirrorFirst: true}}
 	urls := mirrorFirst.build(row, "ABP-888")["urls"].([]map[string]string)
-	want := []string{"mirror_proxy", "mirror_proxy", "mirror_direct", "mirror_direct", "proxy", "direct"}
+	want := []string{"mirror_proxy", "mirror_proxy", "proxy", "direct"}
 	if len(urls) != len(want) {
 		t.Fatalf("urls 数量 %d，期望 %d", len(urls), len(want))
 	}
@@ -114,12 +116,12 @@ func TestURLPriority(t *testing.T) {
 		t.Error("镜像候选应先 mp4 后 hls")
 	}
 
-	proxyFirst := &Server{cfg: Config{ProxyHost: "p", MirrorHost: "m", MirrorProxy: true, MirrorFirst: false}}
+	proxyFirst := &Server{cfg: Config{ProxyHost: "p", MirrorProxy: true, MirrorFirst: false}}
 	urls2 := proxyFirst.build(row, "ABP-888")["urls"].([]map[string]string)
 	if urls2[0]["via"] != "proxy" {
 		t.Errorf("反代优先时首个候选应为 proxy，实际 %q", urls2[0]["via"])
 	}
-	if urls2[len(urls2)-1]["via"] != "mirror_direct" {
+	if urls2[len(urls2)-1]["via"] != "mirror_proxy" {
 		t.Errorf("反代优先时镜像应排最后，实际 %q", urls2[len(urls2)-1]["via"])
 	}
 }
