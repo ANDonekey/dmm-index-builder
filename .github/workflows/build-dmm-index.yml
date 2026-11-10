@@ -17,9 +17,11 @@ name: build-dmm-index
 #
 # 产物：dmm-index.db（实测 ~53 MB / 62 万条），VPS 只需下载即用。
 #
-# 后半程还会把索引库**增量**同步到 Cloudflare D1（步骤 11），供 Pages Functions 查表。
-# 需要三个仓库 secret：CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_DATABASE_ID。
-# 没配就自动跳过，索引库照常发布 —— D1 同步失败不会连累构建产物。
+# 产物 dmm-index.db 直接供 VPS 上的 dmm-query 查询（已内置 k_letters / k_num 键列）。
+#
+# Cloudflare D1 / Worker 已停用（查询层迁到 VPS 本地 SQLite）。相关步骤与代码**保留不删**，
+# 但默认不执行：定时触发不会碰 D1，只有手动 dispatch 把 d1_sync 选成
+# force / bootstrap / reconcile 才会跑。
 
 on:
   schedule:
@@ -37,9 +39,9 @@ on:
         default: false
         type: boolean
       d1_sync:
-        description: '同步到 Cloudflare D1'
+        description: '同步到 Cloudflare D1（已停用：查询层迁到 VPS，默认跳过）'
         required: false
-        default: 'auto'
+        default: 'skip'
         type: choice
         options:
           - auto      # 配了 CLOUDFLARE_API_TOKEN 就同步，没配就跳过
@@ -73,7 +75,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # 下载+解压 1.4GB dump 本来就要 20~30 分钟，再留 D1 同步的余量
+    timeout-minutes: 90   # 下载+解压 1.4GB dump 本来就要 20~30 分钟，再留余量
 
     steps:
       - name: Checkout
@@ -207,6 +209,16 @@ jobs:
             echo -e "\n### 与上一版对比\n- 无历史版本（首次运行）" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # ---------- 7b. 补归一化键列（VPS 查询层依赖）----------
+      # dmm-query 查的是 k_letters / k_num + idx_video_kkey 复合索引，
+      # 不再在进程里建 79 万条的倒排（那要 150~250 MB，VPS 只有不到 1 GB 可用）。
+      # 位置很关键：放在 diff 之后（diff 只比 cid 集合，不受多两列影响），
+      # 放在上传之前（artifact 和 release 拿到的都是 VPS 可直接用的库）。
+      - name: Add normalized keys (for VPS query layer)
+        run: |
+          set -euo pipefail
+          time python migrate-kkey.py dmm-index.db
+
       # ---------- 8. 摘要 ----------
       - name: Summarize
         run: |
@@ -271,7 +283,9 @@ jobs:
       # 兜底的 --reconcile（全表读）只在手动 dispatch 选 `reconcile` 时才跑；默认路径永不触发。
       - name: Sync to D1 (incremental)
         id: d1sync
-        if: github.ref == 'refs/heads/main' && inputs.d1_sync != 'skip'
+        # 已停用：只有手动 dispatch 显式选 force/bootstrap/reconcile 才会跑。
+        # 定时触发时 inputs.d1_sync 为空字符串，不会命中下面任一分支。
+        if: github.ref == 'refs/heads/main' && (inputs.d1_sync == 'force' || inputs.d1_sync == 'bootstrap' || inputs.d1_sync == 'reconcile')
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

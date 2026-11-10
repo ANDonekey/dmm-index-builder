@@ -1,0 +1,32 @@
+[Unit]
+Description=DMM 预览视频查询服务（本地 SQLite）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmmpv
+Group=dmmpv
+EnvironmentFile=-/etc/dmm-query.env
+ExecStart=/opt/dmm-query/dmm-query
+# 索引每周更新，替换文件后 kill -HUP 即可重开库，不用重启进程
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+
+# 内存闸门：服务本身实测 16 MB，留足余量但防止 page cache 失控
+MemoryMax=192M
+MemoryHigh=128M
+
+# 只读运行：除了索引库，什么都不能写
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/opt/dmm-query /var/lib/dmmpv
+
+[Install]
+WantedBy=multi-user.target
