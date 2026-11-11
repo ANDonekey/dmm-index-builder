@@ -18,7 +18,7 @@ RestartSec=3
 MemoryMax=192M
 MemoryHigh=128M
 
-# 只读运行：除了索引库，什么都不能写
+# 只读运行：除了下面那个状态目录，什么都不能写
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -27,6 +27,12 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadOnlyPaths=/opt/dmm-query /var/lib/dmmpv
+
+# 实时回退库（dmm-fallback.db）落在这里。
+# 为什么不放 /var/lib/dmmpv：那个目录整条 ReadOnlyPaths，索引库不该可写 ——
+# 一旦可写，任何服务端漏洞都能改索引库。单独一个目录，systemd 会自动建好
+# 并 chown 给 User=dmmpv。
+StateDirectory=dmmpv-fallback
 
 [Install]
 WantedBy=multi-user.target

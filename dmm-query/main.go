@@ -26,6 +26,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -62,6 +63,14 @@ type Config struct {
 	SignSecret string
 	// SignTTLDays 签名有效期（天，按天对齐）。0 用默认 7。
 	SignTTLDays int
+
+	// —— 库未命中时的实时回退（见 fallback.go）——
+	FallbackDB       string        // 独立可写库，默认 /var/lib/dmmpv-fallback/dmm-fallback.db
+	FallbackEnabled  bool          // 关掉就退回「查不到就是 404」
+	FallbackProxy    string        // DMM 搜索页要走日本出口
+	FallbackTimeout  time.Duration // 单次搜索请求超时
+	FallbackMissTTL  int           // 负结果保质期（天）
+	FallbackInterval time.Duration // 两次回源之间的最小间隔
 }
 
 func env(k, def string) string {
@@ -80,6 +89,15 @@ func envInt(k string, def int) int {
 	return def
 }
 
+func envDur(k string, def time.Duration) time.Duration {
+	if v := env(k, ""); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return def
+}
+
 func loadConfig() Config {
 	c := Config{
 		Listen:      env("LISTEN", "127.0.0.1:8090"),
@@ -92,6 +110,13 @@ func loadConfig() Config {
 		APIKey:      env("DMM_QUERY_KEY", ""),
 		SignSecret:  env("DMM_SIGN_SECRET", ""),
 		SignTTLDays: envInt("DMM_SIGN_TTL_DAYS", signDefaultTTLDays),
+
+		FallbackDB:       env("FALLBACK_DB", "/var/lib/dmmpv-fallback/dmm-fallback.db"),
+		FallbackEnabled:  env("FALLBACK_ENABLED", "1") != "0",
+		FallbackProxy:    env("FALLBACK_PROXY", "socks5://127.0.0.1:1080"),
+		FallbackTimeout:  envDur("FALLBACK_TIMEOUT", 12*time.Second),
+		FallbackMissTTL:  envInt("FALLBACK_MISS_TTL_DAYS", 3),
+		FallbackInterval: envDur("FALLBACK_MIN_INTERVAL", time.Second),
 	}
 	if v := env("CACHE_KIB", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -189,6 +214,14 @@ func (s *Server) lookup(code string) (map[string]any, int) {
 			&r.stem, &r.quality, &r.variant, &r.fmt, &r.source)
 	}
 	if err != nil {
+		// 库里没有 → 试实时回退（DMM 搜索拿 cid，结果落独立库永久复用）。
+		// 只对「确定没这行」触发；真出错（库损坏、超时）不该去打外网。
+		if errors.Is(err, sql.ErrNoRows) {
+			if entry := s.resolver.Resolve(code); entry != nil {
+				s.hits.Add(1)
+				return s.buildFallback(code, entry), http.StatusOK
+			}
+		}
 		s.misses.Add(1)
 		return map[string]any{"code": code, "error": "not found"}, http.StatusNotFound
 	}
@@ -305,17 +338,69 @@ func (s *Server) build(r Row, code string) map[string]any {
 	return out
 }
 
+// buildFallback 用实时解析出来的 cid 拼响应，字段与 build() 保持一致。
+//
+// 能给出的候选只有两类：
+//   - 镜像 HLS：由 cid 机械推导，不烧日本配额（首选）
+//   - DMM /pv/ 直链：走我们自己的反代，兜住镜像没覆盖的片
+//
+// 没有 litevideo 的 mp4 候选 —— 那需要「去零 stem + 档位」两个只有索引库才有的
+// 字段，实时解析拿不到。
+func (s *Server) buildFallback(code string, e *Entry) map[string]any {
+	base := s.publicBase("cc3001")
+
+	out := map[string]any{
+		"code":    strings.ToUpper(code),
+		"cid":     e.CID,
+		"quality": "",
+		"cdn":     "cc3001",
+		// source=live 只是便于排查「这条是库命中还是实时解析」，前端不读
+		"source": "live",
+	}
+
+	var urls []map[string]string
+	add := func(u, typ, via string) {
+		if u != "" {
+			urls = append(urls, map[string]string{"url": u, "type": typ, "via": via})
+		}
+	}
+
+	if p := mirrorHLSPath(e.CID); p != "" {
+		add(base+"/mirror"+p, "hls", "mirror_proxy")
+	}
+	if p := pvPath(e.PVURL); p != "" {
+		add(base+p, "mp4", "proxy")
+		add("https://cc3001.dmm.co.jp"+p, "mp4", "direct")
+		out["proxyUrl"] = base + p
+		out["dmmUrl"] = "https://cc3001.dmm.co.jp" + p
+	}
+
+	out["urls"] = urls
+	return out
+}
+
+// pvPath 从 https://cc3001.dmm.co.jp/pv/<token>/<file>.mp4 里取出 /pv/... 路径。
+func pvPath(raw string) string {
+	i := strings.Index(raw, "/pv/")
+	if i < 0 || !strings.HasSuffix(raw, ".mp4") {
+		return ""
+	}
+	return raw[i:]
+}
+
 /* ---------- HTTP ---------- */
 
 type Server struct {
-	cfg    Config
-	signer *Signer
-	mu     sync.RWMutex
-	db     *sql.DB
+	cfg      Config
+	signer   *Signer
+	resolver *Resolver
+	mu       sync.RWMutex
+	db       *sql.DB
 
 	started time.Time
 	lookups atomic.Int64
 	misses  atomic.Int64
+	hits    atomic.Int64 // 由实时回退补上的次数
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any, extra map[string]string) {
@@ -468,6 +553,25 @@ func main() {
 		started: time.Now(),
 		// 签发方只关心「有没有 secret」，enforce 传 true 无副作用
 		signer: NewSigner(cfg.SignSecret, cfg.SignTTLDays, true),
+	}
+
+	// 实时回退是增强项：初始化失败只记日志，服务照常跑（查不到就是 404）。
+	if cfg.FallbackEnabled {
+		resolver, rerr := NewResolver(FallbackConfig{
+			Enabled:     true,
+			DBPath:      cfg.FallbackDB,
+			SearchBase:  "https://www.dmm.co.jp",
+			ProxyURL:    cfg.FallbackProxy,
+			Timeout:     cfg.FallbackTimeout,
+			MissTTLDays: cfg.FallbackMissTTL,
+			MinInterval: cfg.FallbackInterval,
+		})
+		if rerr != nil {
+			log.Printf("实时回退不可用（继续跑，查不到就是 404）: %v", rerr)
+		} else {
+			s.resolver = resolver
+			log.Printf("实时回退已启用，库 %s，出口 %s", cfg.FallbackDB, cfg.FallbackProxy)
+		}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
