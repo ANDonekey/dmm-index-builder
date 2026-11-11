@@ -387,10 +387,20 @@ func (s *Server) buildFallback(code string, e *Entry) map[string]any {
 		}
 	}
 	if p := pvPath(e.PVURL); p != "" {
-		add(base+p, "mp4", "proxy")
-		add("https://cc3001.dmm.co.jp"+p, "mp4", "direct")
-		out["proxyUrl"] = base + p
-		out["dmmUrl"] = "https://cc3001.dmm.co.jp" + p
+		// 搜索页只内嵌 sm（最低档），同一个 token 目录下一般还有更高档。
+		// 展开成高→低的候选，前端会串行探第一个能播的（见 pvQualityLadder）——
+		// 服务端不逐档探，因为反代没有磁盘缓存，探一档就整文件回源一次。
+		ladder := pvQualityVariants(p)
+		if ladder == nil {
+			ladder = []string{p}
+		}
+		for _, u := range ladder {
+			add(base+u, "mp4", "proxy")
+		}
+		// direct 只给最高那档：非日本 IP 一律 403，多给只会让前端白探。
+		add("https://cc3001.dmm.co.jp"+ladder[0], "mp4", "direct")
+		out["proxyUrl"] = base + ladder[0]
+		out["dmmUrl"] = "https://cc3001.dmm.co.jp" + ladder[0]
 	}
 
 	out["urls"] = urls

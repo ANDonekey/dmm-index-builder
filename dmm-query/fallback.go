@@ -703,8 +703,7 @@ func padCID(cid string) string {
 	return cid[:i] + digits
 }
 
-// mirrorHLSPath 由 cid 推导镜像里的 HLS 清单路径。
-//
+// mirrorHLSPath 由 cid 推导镜像里的 HLS 清单路径。//
 // DMM 的 freepv 目录结构是 <首字符>/<前三位>/<完整cid>，HLS 用完整 cid 作目录名
 // （mp4 那套用的是去零 stem，两者不同）。实测：
 //
@@ -716,4 +715,42 @@ func mirrorHLSPath(cid string) string {
 		return ""
 	}
 	return "/hlsvideo/freepv/" + cid[:1] + "/" + cid[:3] + "/" + cid + "/playlist.m3u8"
+}
+
+/* ---------- 预览清晰度 ---------- */
+
+// pvQualityLadder 是候选清晰度，**从高到低**。
+//
+// 为什么要有它：搜索页内嵌的 /pv/ 直链只有 `sm`（small，最低档），而同一个
+// token 目录下通常还有 hhb/hmb/mhb/mmb/dm 各档 —— 实测 MXGS-1457 的
+// `.../h_068mxgs1457sm.mp4` 换成 hhb/hmb/mhb/mmb/dm 全部 206，只有 4k 是 404。
+// 只取页面里那一条，用户看到的就是最低分辨率。
+//
+// 为什么不在服务端逐档探：dmm-proxy 没有磁盘缓存，`Range: bytes=0-0` 也会
+// 整文件回源 —— 实测探一次 hmb 就吃掉 2.2MB 配额。所以这里只生成候选列表，
+// 交给前端串行探测（第一个能播就停），只有真正播的那一档会下载。
+//
+// 不含 4k：预览片一般几十秒，4k 动辄上百 MB，默认给 fullhd 更合适。
+var pvQualityLadder = []string{"hhb", "hmb", "mhb", "mmb", "sm"}
+
+// pvQualityVariants 把 `/pv/<token>/<cid>sm.mp4` 展开成高→低的一串地址。
+// 拿不到 token 目录或文件名异常时返回 nil（调用方退回单条原地址）。
+func pvQualityVariants(pvPath string) []string {
+	if !strings.HasSuffix(pvPath, ".mp4") {
+		return nil
+	}
+	i := strings.LastIndex(pvPath, "/")
+	if i <= 0 {
+		return nil
+	}
+	dir := pvPath[:i+1]
+	stem := stripQuality(strings.TrimSuffix(pvPath[i+1:], ".mp4"))
+	if stem == "" {
+		return nil
+	}
+	out := make([]string, 0, len(pvQualityLadder))
+	for _, q := range pvQualityLadder {
+		out = append(out, dir+stem+q+".mp4")
+	}
+	return out
 }

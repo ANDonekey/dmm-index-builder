@@ -364,3 +364,42 @@ func TestMirrorHasBothMiss(t *testing.T) {
 		t.Fatalf("mirrorHas = (ok=%v,err=%v)，期望 (false,nil)", ok, err)
 	}
 }
+
+/* ---------- 预览清晰度阶梯 ---------- */
+
+// 搜索页只给 sm，要展开成高→低的一串；用户看到的最低画质就是这个 bug
+func TestPVQualityVariants(t *testing.T) {
+	got := pvQualityVariants("/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457sm.mp4")
+	want := []string{
+		"/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457hhb.mp4",
+		"/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457hmb.mp4",
+		"/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457mhb.mp4",
+		"/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457mmb.mp4",
+		"/pv/DiUNFms3wbDc8Szzv/h_068mxgs1457sm.mp4",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("候选数 %d，期望 %d：%v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("候选[%d] = %q，期望 %q", i, got[i], want[i])
+		}
+	}
+}
+
+// 普通 cid 同样要能展开（sm 后缀去掉后不能把 cid 的数字切坏）
+func TestPVQualityVariantsPlainCID(t *testing.T) {
+	got := pvQualityVariants("/pv/TOKEN/1fns00272sm.mp4")
+	if len(got) != len(pvQualityLadder) || got[0] != "/pv/TOKEN/1fns00272hhb.mp4" {
+		t.Fatalf("展开异常: %v", got)
+	}
+}
+
+// 异常输入不该 panic，也不该编出垃圾地址
+func TestPVQualityVariantsInvalid(t *testing.T) {
+	for _, in := range []string{"", "/pv/TOKEN/x.m3u8", "sm.mp4", "/sm.mp4"} {
+		if got := pvQualityVariants(in); got != nil {
+			t.Fatalf("%q 应返回 nil，得到 %v", in, got)
+		}
+	}
+}
