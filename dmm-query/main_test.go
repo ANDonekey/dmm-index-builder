@@ -74,6 +74,8 @@ func TestHlsUrlUsesFullCid(t *testing.T) {
 			hls = u["url"]
 		}
 	}
+	// URL 必须是**纯路径**：CF 对 /mirror/ 的缓存规则忽略 query，但浏览器缓存
+	// 不是 —— 多带任何参数都会让老访客的缓存失效，命中率白掉。
 	want := "https://cc3001.x/mirror/hlsvideo/freepv/1/1st/1stars00359/playlist.m3u8"
 	if hls != want {
 		t.Errorf("hls 候选 = %q，期望 %q", hls, want)
