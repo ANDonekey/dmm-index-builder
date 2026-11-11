@@ -1,8 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
+	"time"
 )
 
 // 真实搜索页样本（2026-11-12 抓的 FNS-272 结果页，85KB）
@@ -105,5 +111,164 @@ func TestPVPath(t *testing.T) {
 	}
 	if got := pvPath("https://example.com/x.mp4"); got != "" {
 		t.Fatalf("非 /pv/ 地址应返回空，得到 %q", got)
+	}
+}
+
+/* ---------- affiliate API 主路 ---------- */
+
+// 真实响应结构（DMM ItemList v3）。同一部片通常同时有数字层(videoa)和 DVD(mono)
+// 两条：数字层 content_id 是 `1fns00272`，DVD 层是去零的 `1fns272`。
+const affiliateFixture = `{
+  "request": {"parameters": {"keyword": "FNS-272"}},
+  "result": {
+    "status": 200,
+    "result_count": 3,
+    "items": [
+      {"service_code":"mono","floor_code":"dvd","content_id":"1fns272",
+       "maker_product":"FNS-272","URL":"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=1fns272/"},
+      {"service_code":"digital","floor_code":"videoa","content_id":"1fns00272",
+       "maker_product":"FNS-272","URL":"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid=1fns00272/"},
+      {"service_code":"digital","floor_code":"videoa","content_id":"1fns00272br",
+       "maker_product":"FNS-272","URL":"https://www.dmm.co.jp/digital/videoa/-/detail/=/cid=1fns00272br/"}
+    ]
+  }
+}`
+
+func parseAffiliate(t *testing.T, raw string) []affiliateItem {
+	t.Helper()
+	var payload affiliateResponse
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("解析 fixture 失败: %v", err)
+	}
+	if payload.Result.Status != 200 {
+		t.Fatalf("fixture status = %d", payload.Result.Status)
+	}
+	return payload.Result.Items
+}
+
+// 同键多条时优先数字层：videoa 的 content_id 就是镜像路径要的完整形态。
+// 样本是 2026-11-12 抓的真实响应（keyword=FNS00272）。
+func TestPickAffiliateCIDPrefersVideoa(t *testing.T) {
+	items := parseAffiliate(t, loadFixture(t, "affiliate-fns272.json"))
+	if got := pickAffiliateCID(items, "FNS-272"); got != "1fns00272" {
+		t.Fatalf("cid = %q，期望 1fns00272", got)
+	}
+}
+
+// 只有 DVD 条目时，`1fns272` 这种短形态要补零成完整 cid
+func TestPickAffiliateCIDPadsMonoOnly(t *testing.T) {
+	items := parseAffiliate(t, `{"result":{"status":200,"result_count":1,"items":[
+	  {"service_code":"mono","floor_code":"dvd","content_id":"1fns272","maker_product":"FNS-272"}]}}`)
+	if got := pickAffiliateCID(items, "FNS-272"); got != "1fns00272" {
+		t.Fatalf("cid = %q，期望 1fns00272", got)
+	}
+}
+
+// ⚠️ 但 DVD 层不全是短形态：ABP-888 只有 `118abp888`，补零成 `118abp00888`
+// 就是一条不存在的路径。这个用例存在就是为了防止有人把补零改回无条件的。
+func TestPickAffiliateCIDDoesNotPadMultiDigitPrefix(t *testing.T) {
+	items := parseAffiliate(t, `{"result":{"status":200,"result_count":2,"items":[
+	  {"service_code":"mono","floor_code":"dvd","content_id":"118abp888","maker_product":"ABP-888"},
+	  {"service_code":"mono","floor_code":"dvd","content_id":"118abp888dod","maker_product":"ABP-888"}]}}`)
+	if got := pickAffiliateCID(items, "ABP-888"); got != "118abp888" {
+		t.Fatalf("cid = %q，期望 118abp888（不能被补零成 118abp00888）", got)
+	}
+}
+
+// 数字层（standard / premium）同样直接可用
+func TestPickAffiliateCIDAcceptsDigitalFloors(t *testing.T) {
+	items := parseAffiliate(t, `{"result":{"status":200,"result_count":2,"items":[
+	  {"service_code":"digital","floor_code":"standard","content_id":"ssis00095","maker_product":"SSIS-095"},
+	  {"service_code":"mono","floor_code":"dvd","content_id":"ssis095","maker_product":"SSIS-095"}]}}`)
+	if got := pickAffiliateCID(items, "SSIS-095"); got != "ssis00095" {
+		t.Fatalf("cid = %q，期望 ssis00095", got)
+	}
+}
+
+// 相似番号不能被当成命中（FNS-273 的结果不能给 FNS-272）
+func TestPickAffiliateCIDRejectsNearMiss(t *testing.T) {
+	items := parseAffiliate(t, `{"result":{"status":200,"result_count":1,"items":[
+	  {"service_code":"digital","floor_code":"videoa","content_id":"1fns00273","maker_product":"FNS-273"}]}}`)
+	if got := pickAffiliateCID(items, "FNS-272"); got != "" {
+		t.Fatalf("不应命中，得到 %q", got)
+	}
+}
+
+// 补零关键词要排在最前：原码更容易先命中 DVD 那条
+func TestKeywordVariants(t *testing.T) {
+	got := keywordVariants("FNS-272")
+	want := []string{"FNS00272", "FNS-272", "FNS272"}
+	if len(got) != len(want) {
+		t.Fatalf("变体数量 %d，期望 %d（%v）", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("变体[%d] = %q，期望 %q（全量 %v）", i, got[i], want[i], got)
+		}
+	}
+}
+
+// 端到端：假 DMM 服务 + 真实 HTTP 客户端
+func TestFetchViaAPIIntegration(t *testing.T) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.Header().Set("content-type", "application/json")
+		io.WriteString(w, affiliateFixture)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		cfg:       FallbackConfig{APIID: "id", AffiliateID: "aff", APIBase: srv.URL, Timeout: 5 * time.Second},
+		apiClient: &http.Client{Timeout: 5 * time.Second},
+	}
+
+	entry, err := r.fetchViaAPI("FNS-272")
+	if err != nil {
+		t.Fatalf("fetchViaAPI 失败: %v", err)
+	}
+	if entry == nil || entry.CID != "1fns00272" {
+		t.Fatalf("cid 异常: %+v", entry)
+	}
+	if gotQuery.Get("api_id") != "id" || gotQuery.Get("affiliate_id") != "aff" {
+		t.Fatalf("凭据没带上: %v", gotQuery)
+	}
+	if gotQuery.Get("site") != "FANZA" || gotQuery.Get("sort") != "match" {
+		t.Fatalf("参数异常: %v", gotQuery)
+	}
+}
+
+// 400（api_id 限流/失效）必须是**硬失败**，由调用方降级到搜索页；
+// 不能当成「这部片不存在」写进负结果。
+func TestFetchViaAPIRateLimitedIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"result":{"status":400,"errors":{"api_id":"Invalid Request Error"}}}`)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		cfg:       FallbackConfig{APIID: "id", AffiliateID: "aff", APIBase: srv.URL, Timeout: 5 * time.Second},
+		apiClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	if _, err := r.fetchViaAPI("FNS-272"); err == nil {
+		t.Fatal("限流应返回错误，实际返回 nil")
+	}
+}
+
+// 0 命中 = 确实没有，返回 (nil, nil)，不写负结果也不需要降级
+func TestFetchViaAPINoResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"result":{"status":200,"result_count":0,"items":[]}}`)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		cfg:       FallbackConfig{APIID: "id", AffiliateID: "aff", APIBase: srv.URL, Timeout: 5 * time.Second},
+		apiClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	entry, err := r.fetchViaAPI("QQQ-77777")
+	if err != nil || entry != nil {
+		t.Fatalf("期望 (nil,nil)，得到 (%+v, %v)", entry, err)
 	}
 }

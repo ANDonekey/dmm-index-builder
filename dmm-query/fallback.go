@@ -5,12 +5,17 @@
 // 主索引库（dmm-index.db）是从 r18.dev dump 抽出来的，天生滞后：新片、冷门片、
 // 或者 dump 里没收录的，查库就是 404。以前这种情况前端只能显示「未收录」。
 //
-// 但 DMM 自己的搜索页能查到，而且**一次请求就够**：搜索结果的 HTML 里同时内嵌了
-// `content_id` 和 `/pv/<token>/<file>.mp4` 预览直链（实测）。所以回退链路是：
+// 主路走 **DMM affiliate API**（`api.dmm.com/affiliate/v3/ItemList`）：
 //
-//	https://www.dmm.co.jp/search/=/searchstr=FNS-272/   （走日本出口）
-//	  → 从内嵌的 /pv/ 直链里取出完整 cid（1fns00272）
+//	GET https://api.dmm.com/affiliate/v3/ItemList
+//	      ?api_id=&affiliate_id=&site=FANZA&sort=match&keyword=FNS-272&output=json
+//	  → result.items[].content_id = 1fns00272（数字层就是完整 cid）
 //	  → 拼镜像 HLS：/mirror/hlsvideo/freepv/1/1fn/1fns00272/playlist.m3u8
+//
+// 为什么不再抓搜索页：那需要日本出口 + `age_check_done` cookie + 解析 85KB HTML，
+// 单次 2.6~5.4s，还有 bot 风险。affiliate API 直连 0.6s、纯 JSON、不挑出口
+// （实测美国 IP 可用，地域限制只在 www.dmm.co.jp 上）。搜索页只在 API 未配置
+// 或硬失败（限流/凭据失效）时兜底 —— 它的 cid 要从 `/pv/` 文件名里抠，见 pickCID。
 //
 // 为什么不抓 javtrailers 的页面：它前面有 CF 的 bot 挑战，纯 HTTP 客户端进不去；
 // 而 media.javatrailers.com 的媒体路径由 dmm-mirror 用 uTLS 指纹回源，一直好用。
@@ -24,6 +29,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,11 +50,16 @@ import (
 type FallbackConfig struct {
 	Enabled     bool
 	DBPath      string
-	SearchBase  string // https://www.dmm.co.jp
-	ProxyURL    string // socks5://127.0.0.1:1080
+	SearchBase  string // https://www.dmm.co.jp（仅搜索页兜底用）
+	ProxyURL    string // socks5://127.0.0.1:1080（仅搜索页兜底用）
 	Timeout     time.Duration
 	MissTTLDays int
-	MinInterval time.Duration // 两次回源之间的最小间隔，防止把搜索页打爆
+	MinInterval time.Duration // 两次回源之间的最小间隔，防止把源站打爆
+
+	// affiliate API 凭据。两者都非空才启用 API 主路。
+	APIID       string
+	AffiliateID string
+	APIBase     string // 默认 https://api.dmm.com/affiliate/v3/ItemList
 }
 
 /* ---------- 存储 ---------- */
@@ -77,7 +88,9 @@ CREATE TABLE IF NOT EXISTS fallback (
 type Resolver struct {
 	cfg    FallbackConfig
 	db     *sql.DB
-	client *http.Client
+	client *http.Client // 走日本出口，只给搜索页兜底用
+	// affiliate API 不挑出口，直连更快，也不要让 socks 成为单点
+	apiClient *http.Client
 
 	// 同一时刻只允许一个回源：搜索页很重，并发打过去只会被 DMM 掐。
 	fetchMu sync.Mutex
@@ -132,9 +145,20 @@ func NewResolver(cfg FallbackConfig) (*Resolver, error) {
 	}
 
 	return &Resolver{
-		cfg:      cfg,
-		db:       db,
-		client:   &http.Client{Transport: transport, Timeout: cfg.Timeout},
+		cfg:    cfg,
+		db:     db,
+		client: &http.Client{Transport: transport, Timeout: cfg.Timeout},
+		// API 直连：不复用上面那个挂了 socks 的 transport
+		apiClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   8 * time.Second,
+				ResponseHeaderTimeout: cfg.Timeout,
+				MaxIdleConns:          4,
+				IdleConnTimeout:       90 * time.Second,
+			},
+			Timeout: cfg.Timeout,
+		},
 		inflight: make(map[string]*inflightCall),
 	}, nil
 }
@@ -236,11 +260,218 @@ func (r *Resolver) save(letters string, num int64, code string, entry *Entry) er
 	return err
 }
 
-// fetch 打一次 DMM 搜索页，解析出 cid。返回 (nil, nil) 表示「确实没有这部片」。
+// fetch 解析一个番号的 cid。返回 (nil, nil) 表示「确实没有这部片」。
+//
+// 顺序：affiliate API → 搜索页兜底。
+// 只有**硬失败**（网络、限流、凭据失效）才降级到搜索页；API 明确回了 0 条结果
+// 就是「没有」，不该再去打一次 85KB 的页面。
 func (r *Resolver) fetch(code string) (*Entry, error) {
+	// 回源串行化。api_id 的限流是「同 key 跨 IP 全局生效」的（实测 20 并发后
+	// 整批 400 好几分钟），搜索页更怕并发 —— 所以两条路共用一把锁。
 	r.fetchMu.Lock()
 	defer r.fetchMu.Unlock()
 
+	if r.cfg.APIID != "" && r.cfg.AffiliateID != "" {
+		entry, err := r.fetchViaAPI(code)
+		if err == nil {
+			return entry, nil
+		}
+		log.Printf("fallback: %s affiliate API 失败，降级搜索页: %v", code, err)
+	}
+	return r.fetchViaPage(code)
+}
+
+/* ---------- affiliate API 主路 ---------- */
+
+const defaultAffiliateAPI = "https://api.dmm.com/affiliate/v3/ItemList"
+
+type affiliateItem struct {
+	ContentID    string `json:"content_id"`
+	FloorCode    string `json:"floor_code"`
+	ServiceCode  string `json:"service_code"`
+	MakerProduct string `json:"maker_product"`
+	URL          string `json:"URL"`
+}
+
+type affiliateResponse struct {
+	Result struct {
+		Status      int               `json:"status"`
+		ResultCount int               `json:"result_count"`
+		Items       []affiliateItem   `json:"items"`
+		Errors      map[string]string `json:"errors"`
+	} `json:"result"`
+}
+
+// keywordVariants 给出 DMM 搜索的关键词变体。
+//
+// 必须先试补零形态：`FNS-272` 的数字层 cid 是 `1fns00272`，直接搜原码更容易
+// 命中 DVD（mono）那条 `1fns272`。补零后 videoa 的条目排得更前。
+func keywordVariants(code string) []string {
+	c := strings.TrimSpace(code)
+	if c == "" {
+		return nil
+	}
+	seen := make(map[string]bool, 3)
+	out := make([]string, 0, 3)
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	if i := strings.Index(c, "-"); i > 0 {
+		add(c[:i] + "00" + c[i+1:])
+	}
+	add(c)
+	add(strings.ReplaceAll(c, "-", ""))
+	return out
+}
+
+func (r *Resolver) fetchViaAPI(code string) (*Entry, error) {
+	base := r.cfg.APIBase
+	if base == "" {
+		base = defaultAffiliateAPI
+	}
+
+	for _, kw := range keywordVariants(code) {
+		items, err := r.callItemList(base, kw)
+		if err != nil {
+			return nil, err
+		}
+		if cid := pickAffiliateCID(items, code); cid != "" {
+			return &Entry{Code: strings.ToUpper(code), CID: cid, FetchedAt: time.Now()}, nil
+		}
+	}
+	// 所有关键词变体都 0 命中 = 这部片 DMM 上确实没有
+	return nil, nil
+}
+func (r *Resolver) callItemList(base, keyword string) ([]affiliateItem, error) {
+	q := url.Values{}
+	q.Set("api_id", r.cfg.APIID)
+	q.Set("affiliate_id", r.cfg.AffiliateID)
+	q.Set("output", "json")
+	q.Set("site", "FANZA")
+	q.Set("sort", "match")
+	q.Set("hits", "20")
+	q.Set("keyword", keyword)
+
+	req, err := http.NewRequest(http.MethodGet, base+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "ja-JP,ja;q=0.9")
+
+	resp, err := r.apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// 400 一般是 api_id 限流（同 key 并发过高会整批 400 好几分钟）或凭据失效。
+	// 这两种都要当**硬失败**降级，不能当「没有这部片」。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("affiliate API HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+
+	var payload affiliateResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("affiliate API 响应不是 JSON: %w", err)
+	}
+	if payload.Result.Status != 200 {
+		return nil, fmt.Errorf("affiliate API status=%d %v", payload.Result.Status, payload.Result.Errors)
+	}
+	return payload.Result.Items, nil
+}
+
+// pickAffiliateCID 从候选条目里挑出与番号精确匹配的那条，返回完整 cid。
+//
+// 匹配靠 normalizeCode（`1fns00272` / `1fns272` / `FNS-272` 归一后同键），
+// 所以 BR/TK 这类带尾缀字母的版本会被自动排除（正则要求以数字结尾）。
+//
+// 选优规则（2026-11-12 用 8 个番号实测出来的，别凭直觉改）：
+//
+//	floor_code   content_id     镜像里真正用的 cid
+//	videoa       1fns00272      1fns00272   ← 数字层，已经是完整形态
+//	standard     ssis00095      ssis00095
+//	premium      dass00426      dass00426
+//	dvd          118abp888      118abp888   ← **不能补零**，补成 118abp00888 就 404
+//	dvd          1fns272        1fns00272   ← 只有这条才需要补零
+//
+// 所以：优先非 dvd（数字层给的就是规范 cid）；只剩 dvd 时才判断要不要补零，
+// 判据是「前导数字段只有 1 位、尾部数字不足 5 位」——`1fns272` 符合，
+// `118abp888` / `7ipx176` 这类带多位前缀的不符合。
+func pickAffiliateCID(items []affiliateItem, code string) string {
+	wantLetters, wantNum, ok := normalizeCode(code)
+	if !ok {
+		return ""
+	}
+
+	best, bestScore := "", -1
+	for _, it := range items {
+		cid := strings.ToLower(strings.TrimSpace(it.ContentID))
+		if cid == "" {
+			continue
+		}
+		letters, num, ok := normalizeCode(cid)
+		if !ok || letters != wantLetters || num != wantNum {
+			continue
+		}
+		score := 0
+		if it.FloorCode != "dvd" {
+			score += 4 // 数字层：content_id 直接可用
+		}
+		if it.FloorCode == "videoa" {
+			score += 2 // 同属数字层时优先它，和镜像命名最一致
+		}
+		if score > bestScore {
+			best, bestScore = cid, score
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	if bestScore < 4 {
+		return padShortCID(best)
+	}
+	return best
+}
+
+// padShortCID 只对「1 位前导数字 + 不足 5 位尾数字」的短形态补零。
+//
+// 这是 DVD(mono) 层的命名：`1fns272` → `1fns00272`。但同一个层也有
+// `118abp888` 这种完整形态，补零会得到不存在的 `118abp00888`，
+// 所以不能无脑调 padCID。
+func padShortCID(cid string) string {
+	lead := 0
+	for lead < len(cid) && cid[lead] >= '0' && cid[lead] <= '9' {
+		lead++
+	}
+	trail := len(cid)
+	for trail > 0 && cid[trail-1] >= '0' && cid[trail-1] <= '9' {
+		trail--
+	}
+	if lead != 1 || trail >= len(cid) || len(cid)-trail >= 5 {
+		return cid
+	}
+	return padCID(cid)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+/* ---------- 搜索页兜底 ---------- */
+
+// fetchViaPage 打一次 DMM 搜索页，解析出 cid。调用方已持 fetchMu。
+func (r *Resolver) fetchViaPage(code string) (*Entry, error) {
 	if r.cfg.MinInterval > 0 {
 		if wait := r.cfg.MinInterval - time.Since(r.lastAt); wait > 0 {
 			time.Sleep(wait)

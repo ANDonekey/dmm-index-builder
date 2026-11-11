@@ -67,10 +67,14 @@ type Config struct {
 	// —— 库未命中时的实时回退（见 fallback.go）——
 	FallbackDB       string        // 独立可写库，默认 /var/lib/dmmpv-fallback/dmm-fallback.db
 	FallbackEnabled  bool          // 关掉就退回「查不到就是 404」
-	FallbackProxy    string        // DMM 搜索页要走日本出口
-	FallbackTimeout  time.Duration // 单次搜索请求超时
+	FallbackProxy    string        // DMM 搜索页要走日本出口（仅兜底路径用）
+	FallbackTimeout  time.Duration // 单次回源超时
 	FallbackMissTTL  int           // 负结果保质期（天）
-	FallbackInterval time.Duration // 两次回源之间的最小间隔
+	FallbackInterval time.Duration // 搜索页两次回源之间的最小间隔
+	// affiliate API 凭据。都非空才走 API 主路，否则直接用搜索页兜底。
+	FallbackAPIID       string
+	FallbackAffiliateID string
+	FallbackAPIBase     string
 }
 
 func env(k, def string) string {
@@ -117,6 +121,10 @@ func loadConfig() Config {
 		FallbackTimeout:  envDur("FALLBACK_TIMEOUT", 12*time.Second),
 		FallbackMissTTL:  envInt("FALLBACK_MISS_TTL_DAYS", 3),
 		FallbackInterval: envDur("FALLBACK_MIN_INTERVAL", time.Second),
+
+		FallbackAPIID:       env("DMM_API_ID", ""),
+		FallbackAffiliateID: env("DMM_AFFILIATE_ID", ""),
+		FallbackAPIBase:     env("DMM_API_BASE", ""),
 	}
 	if v := env("CACHE_KIB", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -565,12 +573,19 @@ func main() {
 			Timeout:     cfg.FallbackTimeout,
 			MissTTLDays: cfg.FallbackMissTTL,
 			MinInterval: cfg.FallbackInterval,
+			APIID:       cfg.FallbackAPIID,
+			AffiliateID: cfg.FallbackAffiliateID,
+			APIBase:     cfg.FallbackAPIBase,
 		})
 		if rerr != nil {
 			log.Printf("实时回退不可用（继续跑，查不到就是 404）: %v", rerr)
 		} else {
 			s.resolver = resolver
-			log.Printf("实时回退已启用，库 %s，出口 %s", cfg.FallbackDB, cfg.FallbackProxy)
+			src := "搜索页（未配 DMM_API_ID / DMM_AFFILIATE_ID）"
+			if cfg.FallbackAPIID != "" && cfg.FallbackAffiliateID != "" {
+				src = "affiliate API"
+			}
+			log.Printf("实时回退已启用，库 %s，主路 %s", cfg.FallbackDB, src)
 		}
 	}
 	mux := http.NewServeMux()
