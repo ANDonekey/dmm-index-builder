@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,9 @@ type FallbackConfig struct {
 	APIID       string
 	AffiliateID string
 	APIBase     string // 默认 https://api.dmm.com/affiliate/v3/ItemList
+	// MirrorBase 本地 dmm-mirror 的 /mirror 前缀，用来验证 cid 在镜像里到底
+	// 有没有收录。空 = 不验证（退回「按 cid 直接返回」的旧行为）。
+	MirrorBase string
 }
 
 /* ---------- 存储 ---------- */
@@ -276,9 +280,74 @@ func (r *Resolver) fetch(code string) (*Entry, error) {
 		if err == nil {
 			return entry, nil
 		}
-		log.Printf("fallback: %s affiliate API 失败，降级搜索页: %v", code, err)
+		if errors.Is(err, errMirrorMiss) {
+			// API 认识这部片，但镜像没收录它的 HLS。搜索页给的是 DMM 的 /pv/
+			// 直链，能覆盖镜像的缺口，所以这里**降级**而不是直接判 404。
+			log.Printf("fallback: %s 镜像无此片，改走搜索页取 /pv/", code)
+		} else {
+			log.Printf("fallback: %s affiliate API 失败，降级搜索页: %v", code, err)
+		}
 	}
 	return r.fetchViaPage(code)
+}
+
+// errMirrorMiss 表示「API 查到了 cid，但镜像没有对应的 HLS」。
+// 它和「查无此片」必须分开：前者还能靠搜索页的 /pv/ 直链救回来。
+var errMirrorMiss = errors.New("镜像未收录该 cid")
+
+// mirrorHas 用本地 dmm-mirror 探一下 cid 的 HLS 清单在不在。
+//
+// 为什么要探：镜像的上游（javtrailers）覆盖率不是 100%，实测 MXGS-1456 及之后
+// 整批没有，而 1455 及之前都有。cid 是从 API 推出来的，光看 API 判断不了镜像
+// 有没有 —— 直接回一条 404 的地址给前端，用户看到的是「有源但播不了」。
+//
+// 探的是 127.0.0.1 上的 mirror（不经 CF），所以**不会**把 404 写进 CF 的边缘
+// 缓存（那条 cache rule 会把 404 也缓存一年）。
+func (r *Resolver) mirrorHas(cid string) (string, bool, error) {
+	if r.cfg.MirrorBase == "" {
+		return "", false, nil
+	}
+	base := strings.TrimRight(r.cfg.MirrorBase, "/")
+
+	var lastErr error
+	for _, c := range cidVariants(cid) {
+		p := mirrorHLSPath(c)
+		if p == "" {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, base+p, nil)
+		if err != nil {
+			return "", false, err
+		}
+		resp, err := r.apiClient.Do(req)
+		if err != nil {
+			// 探不动 ≠ 没有。交给调用方决定（当前策略：当作有，保持旧行为）
+			lastErr = err
+			continue
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return c, true, nil
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			lastErr = fmt.Errorf("mirror HTTP %d", resp.StatusCode)
+		}
+	}
+	return "", false, lastErr
+}
+
+// cidVariants 给出同一个作品可能用的几种 cid 写法。
+//
+// `h_068mxgs1457`（API 给的 DVD 形态，数字不补零）和 `h_068mxgs01457`
+// （索引库里存的形态，补到 5 位）在镜像里只会有其中一个，所以要都试。
+// 顺序很重要：原样优先 —— `118abp888` 这种补零反而会变成不存在的路径。
+func cidVariants(cid string) []string {
+	out := []string{cid}
+	if padded := padCID(cid); padded != cid {
+		out = append(out, padded)
+	}
+	return out
 }
 
 /* ---------- affiliate API 主路 ---------- */
@@ -338,9 +407,26 @@ func (r *Resolver) fetchViaAPI(code string) (*Entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		if cid := pickAffiliateCID(items, code); cid != "" {
+		cid := pickAffiliateCID(items, code)
+		if cid == "" {
+			continue
+		}
+
+		// 拿到 cid 先问镜像：没收录就返回 errMirrorMiss，让调用方去搜索页拿 /pv/。
+		// 探不动（网络错）时不做判断，按 cid 原样返回 —— 不能因为探针故障就
+		// 把本来能播的片判死。
+		chosen, ok, probeErr := r.mirrorHas(cid)
+		if probeErr != nil {
+			log.Printf("fallback: %s 镜像探测失败（按有源处理）: %v", code, probeErr)
 			return &Entry{Code: strings.ToUpper(code), CID: cid, FetchedAt: time.Now()}, nil
 		}
+		if r.cfg.MirrorBase != "" && !ok {
+			return nil, errMirrorMiss
+		}
+		if ok {
+			cid = chosen
+		}
+		return &Entry{Code: strings.ToUpper(code), CID: cid, FetchedAt: time.Now()}, nil
 	}
 	// 所有关键词变体都 0 命中 = 这部片 DMM 上确实没有
 	return nil, nil
@@ -417,7 +503,7 @@ func pickAffiliateCID(items []affiliateItem, code string) string {
 		if cid == "" {
 			continue
 		}
-		letters, num, ok := normalizeCode(cid)
+		letters, num, ok := normalizeCID(cid)
 		if !ok || letters != wantLetters || num != wantNum {
 			continue
 		}
@@ -520,10 +606,34 @@ var (
 	// 预览直链：https://cc3001.dmm.co.jp/pv/<62位token>/<文件名>.mp4
 	// 文件名就是「cid + 清晰度」，例如 1fns00272sm.mp4 —— 这是拿完整 cid 的入口，
 	// 搜索页里 `cid=1fns272` 那种是**去掉前导零**的短形态，不能直接拼路径。
-	pvURLRe = regexp.MustCompile(`https://cc3001\.dmm\.co\.jp/pv/[A-Za-z0-9_-]+/[a-z0-9]+\.mp4`)
+	pvURLRe = regexp.MustCompile(`https://cc3001\.dmm\.co\.jp/pv/[A-Za-z0-9_-]+/[a-z0-9_]+\.mp4`)
 	// 兜底：没有 pv 直链时用 cid= 参数（短形态，需要补零）
-	cidParamRe = regexp.MustCompile(`cid=([a-z0-9]+)`)
+	cidParamRe = regexp.MustCompile(`cid=([a-z0-9_]+)`)
 )
+
+// cidSuffixRe 只认「尾部」的字母段 + 数字段，**不锚定开头**。
+//
+// 为什么不能像 normalizeCode 那样整串匹配：DMM 的 content_id 有带前缀的形态，
+// 例如 `h_068mxgs1457`（厂商前缀 `h_068`）。整串正则会直接判失败，于是
+// 「API 明明返回了这部片，我们却当没查到」—— MXGS-1457 就是这么丢的。
+// 后缀匹配对 `1fns00272` / `118abp888` / `h_068mxgs1457` 都能取到 mxgs:1457 这类键。
+var cidSuffixRe = regexp.MustCompile(`([a-z]+)(\d+)$`)
+
+// normalizeCID 把 content_id / pv 文件名归一成 (字母段, 数字值)，用于判等。
+// 与 normalizeCode 的区别只在「允许前缀」，输入校验那条路不要改。
+func normalizeCID(raw string) (letters string, num int64, ok bool) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.NewReplacer("-", "", "_", "", " ", "", "\t", "").Replace(s)
+	m := cidSuffixRe.FindStringSubmatch(s)
+	if m == nil {
+		return "", 0, false
+	}
+	n, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return m[1], n, true
+}
 
 // 文件名尾部的清晰度标记。**从长到短**匹配，否则 "dmb" 会被 "mb" 之类切坏。
 var qualitySuffixes = []string{
@@ -542,7 +652,7 @@ func pickCID(html, code string) (cid, pvURL string) {
 	}
 
 	matches := func(candidate string) bool {
-		letters, num, ok := normalizeCode(candidate)
+		letters, num, ok := normalizeCID(candidate)
 		return ok && letters == wantLetters && num == wantNum
 	}
 

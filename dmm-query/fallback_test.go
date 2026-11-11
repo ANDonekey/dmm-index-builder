@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -270,5 +271,96 @@ func TestFetchViaAPINoResult(t *testing.T) {
 	entry, err := r.fetchViaAPI("QQQ-77777")
 	if err != nil || entry != nil {
 		t.Fatalf("期望 (nil,nil)，得到 (%+v, %v)", entry, err)
+	}
+}
+
+/* ---------- 带厂商前缀的 cid（h_068mxgs1457） ---------- */
+
+// 这是 MXGS-1457 拿不到预览的根因：content_id 带 `h_068` 前缀，
+// 整串正则匹配不上，API 明明返回了也被丢弃。
+func TestNormalizeCIDWithVendorPrefix(t *testing.T) {
+	letters, num, ok := normalizeCID("h_068mxgs1457")
+	if !ok || letters != "mxgs" || num != 1457 {
+		t.Fatalf("normalizeCID = (%q,%d,%v)，期望 (mxgs,1457,true)", letters, num, ok)
+	}
+	wantL, wantN, _ := normalizeCode("MXGS-1457")
+	if letters != wantL || num != wantN {
+		t.Fatalf("与番号键不一致: cid=%s:%d code=%s:%d", letters, num, wantL, wantN)
+	}
+}
+
+// 搜索页兜底路径同样要认这种 cid（真实页面样本）
+func TestPickCIDWithVendorPrefix(t *testing.T) {
+	html := loadFixture(t, "search-mxgs1457.html")
+	cid, pv := pickCID(html, "MXGS-1457")
+	if cid != "h_068mxgs1457" {
+		t.Fatalf("cid = %q，期望 h_068mxgs1457", cid)
+	}
+	if pv == "" || !strings.HasSuffix(pv, ".mp4") {
+		t.Fatalf("pv 直链异常: %q", pv)
+	}
+}
+
+// API 侧：带前缀的 content_id 要能选中，且不做补零（前缀不是单字符）
+func TestPickAffiliateCIDWithVendorPrefix(t *testing.T) {
+	items := parseAffiliate(t, `{"result":{"status":200,"result_count":2,"items":[
+	  {"service_code":"mono","floor_code":"dvd","content_id":"h_068mxgs1457","maker_product":null},
+	  {"service_code":"mono","floor_code":"dvd","content_id":"h_068mxgs1457bod","maker_product":null}]}}`)
+	if got := pickAffiliateCID(items, "MXGS-1457"); got != "h_068mxgs1457" {
+		t.Fatalf("cid = %q，期望 h_068mxgs1457", got)
+	}
+}
+
+// 同一个作品在镜像里可能只认补零形态，两种都要试，原样优先
+func TestCIDVariants(t *testing.T) {
+	got := cidVariants("h_068mxgs1457")
+	if len(got) != 2 || got[0] != "h_068mxgs1457" || got[1] != "h_068mxgs01457" {
+		t.Fatalf("cidVariants = %v", got)
+	}
+	// 已经补过零的不重复
+	if got := cidVariants("h_068mxgs01457"); len(got) != 1 {
+		t.Fatalf("已补零的应只有一种写法，得到 %v", got)
+	}
+}
+
+// 镜像探针：原样 404、补零 200 → 选中补零那条
+func TestMirrorHasFallsBackToPadded(t *testing.T) {
+	var asked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		if strings.Contains(r.URL.Path, "h_068mxgs01457") {
+			io.WriteString(w, "#EXTM3U")
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		cfg:       FallbackConfig{MirrorBase: srv.URL + "/mirror"},
+		apiClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	cid, ok, err := r.mirrorHas("h_068mxgs1457")
+	if err != nil || !ok || cid != "h_068mxgs01457" {
+		t.Fatalf("mirrorHas = (%q,%v,%v)，期望 (h_068mxgs01457,true,nil)", cid, ok, err)
+	}
+	if len(asked) != 2 {
+		t.Fatalf("应依次探两种写法，实际 %v", asked)
+	}
+}
+
+// 两种写法都 404 → (false, nil)，由调用方降级到搜索页
+func TestMirrorHasBothMiss(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		cfg:       FallbackConfig{MirrorBase: srv.URL + "/mirror"},
+		apiClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	if _, ok, err := r.mirrorHas("h_068mxgs1457"); err != nil || ok {
+		t.Fatalf("mirrorHas = (ok=%v,err=%v)，期望 (false,nil)", ok, err)
 	}
 }

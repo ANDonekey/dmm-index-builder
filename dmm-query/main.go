@@ -75,6 +75,7 @@ type Config struct {
 	FallbackAPIID       string
 	FallbackAffiliateID string
 	FallbackAPIBase     string
+	FallbackMirrorBase  string // 本地 mirror 前缀，用来验证 cid 有没有被收录
 }
 
 func env(k, def string) string {
@@ -125,6 +126,7 @@ func loadConfig() Config {
 		FallbackAPIID:       env("DMM_API_ID", ""),
 		FallbackAffiliateID: env("DMM_AFFILIATE_ID", ""),
 		FallbackAPIBase:     env("DMM_API_BASE", ""),
+		FallbackMirrorBase:  env("FALLBACK_MIRROR_BASE", "http://127.0.0.1:8091/mirror"),
 	}
 	if v := env("CACHE_KIB", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -373,8 +375,16 @@ func (s *Server) buildFallback(code string, e *Entry) map[string]any {
 		}
 	}
 
-	if p := mirrorHLSPath(e.CID); p != "" {
-		add(base+"/mirror"+p, "hls", "mirror_proxy")
+	// 镜像 HLS 只在「确认镜像收录了这部片」时才给。
+	//
+	// 判据是 PVURL：为空 = 走 API 主路，cid 已经用本地 mirror 探过 200；
+	// 非空 = 走搜索页兜底，而这条路正是**因为镜像没有**才降级的
+	// （见 fallback.go 的 errMirrorMiss）。再回一条必然 404 的镜像地址，
+	// 前端会白探一次，而且 CF 对 /mirror/ 的 cache rule 会把 404 也缓存一年。
+	if e.PVURL == "" {
+		if p := mirrorHLSPath(e.CID); p != "" {
+			add(base+"/mirror"+p, "hls", "mirror_proxy")
+		}
 	}
 	if p := pvPath(e.PVURL); p != "" {
 		add(base+p, "mp4", "proxy")
@@ -576,6 +586,7 @@ func main() {
 			APIID:       cfg.FallbackAPIID,
 			AffiliateID: cfg.FallbackAffiliateID,
 			APIBase:     cfg.FallbackAPIBase,
+			MirrorBase:  cfg.FallbackMirrorBase,
 		})
 		if rerr != nil {
 			log.Printf("实时回退不可用（继续跑，查不到就是 404）: %v", rerr)
