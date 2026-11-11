@@ -34,6 +34,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -54,6 +55,11 @@ type Config struct {
 	UA       string
 	// 只允许反代这两个路径前缀，防止被当成任意 URL 的开放代理（SSRF）
 	Allowed []string
+
+	// 链接签名：由 dmm-query 签发，这里校验。
+	// 为空 = 不校验（灰度/回滚）；Enforce=false 时只记日志不拦。
+	SignSecret  string
+	SignEnforce bool
 }
 
 func env(k, def string) string {
@@ -69,6 +75,9 @@ func loadConfig() Config {
 		Upstream: strings.TrimRight(env("UPSTREAM", "https://media.javtrailers.com"), "/"),
 		Profile:  strings.ToLower(env("TLS_PROFILE", "chrome120")),
 		Allowed:  []string{"/litevideo/freepv/", "/hlsvideo/freepv/"},
+
+		SignSecret:  env("DMM_SIGN_SECRET", ""),
+		SignEnforce: env("DMM_SIGN_ENFORCE", "1") != "0",
 	}
 	switch c.Profile {
 	case "chrome120":
@@ -131,6 +140,7 @@ func newClient(cfg Config) *http.Client {
 type Server struct {
 	cfg     Config
 	client  *http.Client
+	signer  *Signer
 	started time.Time
 
 	hits   atomic.Int64 // 回源成功
@@ -156,6 +166,67 @@ func fixContentType(p, ct string) string {
 // 让 CF 缓存完整对象，而不是只缓存 0-xxx 这一段。
 var fullRange = regexp.MustCompile(`^bytes=0-$`)
 
+// 清单上限。真实清单只有几 KB（master 6 行、变体 100 多行），1MB 是防呆上限，
+// 免得被一个畸形上游拖成整文件读进内存。
+const maxPlaylistBytes = 1 << 20
+
+// 标签行里带 URI="..." 的属性（EXT-X-KEY / EXT-X-MAP / EXT-X-MEDIA）。
+var uriAttrRe = regexp.MustCompile(`URI="([^"]+)"`)
+
+// rewritePlaylist 给 m3u8 里的每一条相对 URI 补上签名。
+//
+// 一行一签（而不是把请求自己的 query 抄下去）：签名绑的是具体路径，抄下去
+// 只会让分片请求验签失败。绝对地址（http/https/data:）原样保留 —— 那些不在
+// 我们的反代后面，也签不了。
+func (s *Server) rewritePlaylist(body []byte, manifestPath string) []byte {
+	if !s.signer.Enabled() {
+		return body
+	}
+
+	now := time.Now()
+	base := &url.URL{Path: manifestPath}
+
+	sign := func(raw string) string {
+		ref, err := url.Parse(raw)
+		if err != nil || ref.IsAbs() || ref.Scheme != "" {
+			return raw
+		}
+		q := s.signer.SignPath(base.ResolveReference(ref).Path, now)
+		if q == "" {
+			return raw
+		}
+		sep := "?"
+		if strings.Contains(raw, "?") {
+			sep = "&"
+		}
+		return raw + sep + q
+	}
+
+	lines := strings.Split(string(body), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		suffix := line[len(trimmed):] // 保留原来的 \r，别把 CRLF 清单改成 LF
+
+		if trimmed == "" {
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "#") {
+			if strings.Contains(trimmed, `URI="`) {
+				lines[i] = uriAttrRe.ReplaceAllStringFunc(trimmed, func(m string) string {
+					inner := strings.TrimSuffix(strings.TrimPrefix(m, `URI="`), `"`)
+					return `URI="` + sign(inner) + `"`
+				}) + suffix
+			}
+			continue
+		}
+
+		lines[i] = sign(trimmed) + suffix
+	}
+
+	return []byte(strings.Join(lines, "\n"))
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("allow", "GET, HEAD")
@@ -166,6 +237,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/_stats" {
 		s.stats(w)
 		return
+	}
+
+	// 链接签名（签发方是 dmm-query，这里只验）。放在路径白名单之前：
+	// 没签名的请求连「这条路径存不存在」都不该被回答，否则就成了一个免费的
+	// 资源探测接口。secret 没配或 enforce 关闭时只记日志放行。
+	if verdict := s.signer.Verify(r, time.Now()); verdict != signOK && verdict != signDisabled {
+		if s.signer.Enforcing() {
+			w.Header().Set("cache-control", "no-store")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		log.Printf("sign: %s %s", verdict, r.URL.Path)
 	}
 
 	p := strings.TrimPrefix(r.URL.Path, "/mirror")
@@ -253,6 +336,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("上游 %d %s", resp.StatusCode, p)
 	}
 
+	// HLS 清单改写。
+	//
+	// 清单里的变体清单和 .ts 分片都是**相对路径**（实测），而浏览器/hls.js 解析
+	// 相对 URI 时会把 query 整个丢掉 —— 那些后续请求带不上 `?e=&s=`，验签一开
+	// 就全 403，HLS 直接播不了。所以必须在返回前把每条相对 URI 换成带签名的地址。
+	//
+	// 只对 200 的 .m3u8 做：mp4 不需要，也别把二进制当文本读。
+	if strings.HasSuffix(p, ".m3u8") && resp.StatusCode == http.StatusOK && r.Method != http.MethodHead {
+		if body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBytes)); rerr == nil {
+			// ⚠️ 必须传 r.URL.Path（带 /mirror 前缀），不是上面剥过的 p ——
+			// 签名是对「反代收到的那条路径」算的，传 p 会签成 /hlsvideo/...，
+			// 与验签时用的 r.URL.Path 对不上，表现就是所有清单 403。
+			out := s.rewritePlaylist(body, r.URL.Path)
+			// 正文变了，这几个头必须作废：留着 ETag/Last-Modified 会让条件请求
+			// 拿到 304 + 旧正文（没有签名），播放器照样挂。
+			h.Set("Content-Type", "application/vnd.apple.mpegurl")
+			h.Set("Content-Length", strconv.Itoa(len(out)))
+			h.Del("Content-Range")
+			h.Del("ETag")
+			h.Del("Last-Modified")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(out)
+			return
+		}
+	}
+
 	w.WriteHeader(resp.StatusCode)
 
 	if r.Method == http.MethodHead {
@@ -300,7 +409,8 @@ func (s *Server) stats(w http.ResponseWriter) {
 
 func main() {
 	cfg := loadConfig()
-	s := &Server{cfg: cfg, client: newClient(cfg), started: time.Now()}
+	s := &Server{cfg: cfg, client: newClient(cfg), started: time.Now(),
+		signer: NewSigner(cfg.SignSecret, signDefaultTTLDays, cfg.SignEnforce)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.ServeHTTP)

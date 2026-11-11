@@ -56,7 +56,10 @@ echo "== 5. 启动 =="
 systemctl restart dmm-query
 sleep 1
 systemctl is-active dmm-query
-curl -sf "http://127.0.0.1:$LISTEN_PORT/health" || { echo "✗ 健康检查失败"; journalctl -u dmm-query -n 20 --no-pager; exit 1; }
+# /health 现在也要过准入（DMM_QUERY_KEY 配了就必须带）；没配就裸调。
+# 这里直接读 env 文件，别指望脚本环境里有这个变量。
+QUERY_KEY=$(sed -n 's/^DMM_QUERY_KEY=//p' /etc/dmm-query.env 2>/dev/null | head -1 || true)
+curl -sf -H "X-Dmm-Key: ${QUERY_KEY}" "http://127.0.0.1:$LISTEN_PORT/health" || { echo "✗ 健康检查失败"; journalctl -u dmm-query -n 20 --no-pager; exit 1; }
 echo
 
 echo "== 6. nginx（可选） =="

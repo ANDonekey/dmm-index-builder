@@ -24,6 +24,7 @@ type Server struct {
 	up      *http.Client
 	quota   *Quota
 	limiter *rateLimiter
+	signer  *Signer
 }
 
 func main() {
@@ -40,7 +41,8 @@ func main() {
 		log.Fatalf("配额初始化失败: %v", err)
 	}
 	s := &Server{cfg: cfg, cache: cache, up: newUpstreamClient(cfg),
-		quota: quota, limiter: newRateLimiter(cfg.RateLimitPerMin)}
+		quota: quota, limiter: newRateLimiter(cfg.RateLimitPerMin),
+		signer: NewSigner(cfg.SignSecret, signDefaultTTLDays, cfg.SignEnforce)}
 
 	// 配额每 30 秒落盘一次；收到终止信号时立即落盘再退出
 	stop := make(chan struct{})
@@ -99,6 +101,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// 链接签名（签发方是 dmm-query，这里只验）。
+	//
+	// 必须放在 resolve 之前：没签名的请求连路径解析都不该走，更不该有机会命中
+	// 磁盘缓存 —— 缓存命中是零回源成本的，等于免费送流量。
+	//
+	// secret 没配（signDisabled）或 enforce 关闭时只记日志放行，用于灰度观察。
+	if verdict := s.signer.Verify(r, time.Now()); verdict != signOK && verdict != signDisabled {
+		if s.signer.Enforcing() {
+			w.Header().Set("cache-control", "no-store")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		log.Printf("sign: %s %s", verdict, r.URL.Path)
 	}
 
 	upstream, ok := s.resolve(r)

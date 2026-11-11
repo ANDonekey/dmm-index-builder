@@ -55,6 +55,12 @@ type Config struct {
 	CacheControl    string        // 覆盖源站 no-store/no-cache
 	UpstreamTimeout time.Duration // 单次回源总超时（含下载完整个文件）
 	FlightWait      time.Duration // follower 等待 leader 下载完成的最长时间
+
+	// —— 链接签名 ——
+	// 由 dmm-query 签发、这里校验。为空 = 不校验（等价于改动前的行为，用于灰度/回滚）。
+	// Enforce=false 时只记日志不拦，用来先观察一天确认没有误杀。
+	SignSecret  string
+	SignEnforce bool
 }
 
 func envStr(k, def string) string {
@@ -166,6 +172,9 @@ func LoadConfig() (*Config, error) {
 		CacheControl:    envStr("CACHE_CONTROL", "public, max-age=31536000, s-maxage=31536000, immutable"),
 		UpstreamTimeout: envDur("UPSTREAM_TIMEOUT", 10*time.Minute),
 		FlightWait:      envDur("FLIGHT_WAIT", 3*time.Minute),
+
+		SignSecret:  envStr("DMM_SIGN_SECRET", ""),
+		SignEnforce: envStr("DMM_SIGN_ENFORCE", "1") != "0",
 	}
 
 	// 流量限制：默认按 0.1 倍节点计费口径，日 2GB / 月 30GB

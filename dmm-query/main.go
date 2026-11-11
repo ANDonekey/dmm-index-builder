@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -51,11 +52,30 @@ type Config struct {
 	MirrorProxy bool   // true = 包含「走自己反代」的镜像候选（CF 边缘缓存）
 	MirrorFirst bool   // true = urls 里镜像排前面（省日本出口配额），false = 反代优先
 	CacheKiB    int    // SQLite page cache，默认 16384 KiB
+
+	// APIKey 是查询接口的准入密钥。前端不直接打这个服务，而是经本站
+	// Pages Functions 代查（密钥只在服务端），所以这个值只有 CF 知道。
+	// 为空 = 不校验，用于灰度与回滚。
+	APIKey string
+	// SignSecret 是预览链接的签名密钥，必须与 dmm-proxy / dmm-mirror 一致。
+	// 为空 = 不签，返回的 URL 就是裸的（等价于改动前的行为）。
+	SignSecret string
+	// SignTTLDays 签名有效期（天，按天对齐）。0 用默认 7。
+	SignTTLDays int
 }
 
 func env(k, def string) string {
 	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := env(k, ""); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }
@@ -69,6 +89,9 @@ func loadConfig() Config {
 		MirrorProxy: env("MIRROR_PROXY", "1") != "0",
 		MirrorFirst: env("MIRROR_FIRST", "1") != "0",
 		CacheKiB:    16384,
+		APIKey:      env("DMM_QUERY_KEY", ""),
+		SignSecret:  env("DMM_SIGN_SECRET", ""),
+		SignTTLDays: envInt("DMM_SIGN_TTL_DAYS", signDefaultTTLDays),
 	}
 	if v := env("CACHE_KIB", ""); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -207,7 +230,14 @@ func (s *Server) build(r Row, code string) map[string]any {
 
 	dmmURL := "https://" + r.cdn + ".dmm.co.jp" + path
 	base := s.publicBase(r.cdn)
-	proxyURL := base + path + cdnQuery(r.cdn)
+
+	// 反代出来的地址一律带签名。dmmUrl 是 DMM 自己的域名，我们签不了也不该签
+	// （它只对日本 IP 有效，不消耗我们的带宽和配额）。
+	//
+	// 签名的 path 必须是「反代服务看到的那条路径」：dmm-proxy 收到 /litevideo/...，
+	// dmm-mirror 收到 /mirror/...，两边都用 r.URL.Path 验签，所以这里按最终 URL 签。
+	now := time.Now()
+	proxyURL := s.signer.SignURL(base+path+cdnQuery(r.cdn), now)
 
 	out := map[string]any{
 		"code":     code,
@@ -231,14 +261,14 @@ func (s *Server) build(r Row, code string) map[string]any {
 	if s.cfg.MirrorProxy {
 		if strings.HasPrefix(path, "/litevideo/freepv/") {
 			// mirror 的上游固定是 javtrailers，不需要 cdn 参数
-			mirrorProxyMP4 = base + "/mirror" + path
+			mirrorProxyMP4 = s.signer.SignURL(base+"/mirror"+path, now)
 		}
 		// HLS 体系的目录用**完整 cid** 作 stem，不是 litevideo 那个去零 stem。
 		// 例：ksbj141 的 mp4 在 k/ksb/ksbj141/，HLS 在 k/ksb/ksbj00141/playlist.m3u8
 		// DMM 路径全小写，而库里 cid 可能带大写（1STARS00359），必须转小写
 		if i := strings.LastIndex(r.dirpath, "/"); i > 0 {
-			mirrorProxyHLS = base + "/mirror/hlsvideo/freepv/" +
-				r.dirpath[:i] + "/" + strings.ToLower(r.cid) + "/playlist.m3u8"
+			mirrorProxyHLS = s.signer.SignURL(base+"/mirror/hlsvideo/freepv/"+
+				r.dirpath[:i]+"/"+strings.ToLower(r.cid)+"/playlist.m3u8", now)
 		}
 	}
 	if mirrorProxyMP4 != "" {
@@ -278,9 +308,10 @@ func (s *Server) build(r Row, code string) map[string]any {
 /* ---------- HTTP ---------- */
 
 type Server struct {
-	cfg Config
-	mu  sync.RWMutex
-	db  *sql.DB
+	cfg    Config
+	signer *Signer
+	mu     sync.RWMutex
+	db     *sql.DB
 
 	started time.Time
 	lookups atomic.Int64
@@ -306,6 +337,19 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("access-control-allow-methods", "GET, OPTIONS")
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// 准入：只有本站的 Pages Functions 该拿到这个密钥（它带 X-Dmm-Key 代查）。
+	// 未配置 DMM_QUERY_KEY 时一律放行 —— 这是灰度开关，配好再打开。
+	// /health 与 /_stats 也一起挡：它们会暴露索引行数、查询次数、堆占用，
+	// 属于「不该给陌生人看」的运维信息。
+	if s.cfg.APIKey != "" {
+		got := r.Header.Get("X-Dmm-Key")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.APIKey)) != 1 {
+			writeJSON(w, http.StatusUnauthorized,
+				map[string]any{"error": "unauthorized"}, map[string]string{"cache-control": "no-store"})
+			return
+		}
 	}
 
 	// 允许挂在 /api 前缀下（nginx 复用现有域名，不必再签一张证书）。
@@ -418,7 +462,13 @@ func main() {
 		log.Fatalf("打开索引库失败 %s: %v", cfg.DBPath, err)
 	}
 
-	s := &Server{cfg: cfg, db: db, started: time.Now()}
+	s := &Server{
+		cfg:     cfg,
+		db:      db,
+		started: time.Now(),
+		// 签发方只关心「有没有 secret」，enforce 传 true 无副作用
+		signer: NewSigner(cfg.SignSecret, cfg.SignTTLDays, true),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 
