@@ -27,6 +27,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -259,6 +260,58 @@ func cdnQuery(cdn string) string {
 	return "?cdn=" + cdn
 }
 
+// mirrorAvailable 判断 cid 的 HLS 清单在本地 mirror 里能不能取到。
+//
+// 为什么要探而不是直接发：CF 对 /mirror/ 的 cache rule 是
+// `edge_ttl: override_origin 31536000`，**404 也会被缓存一年**（实测
+// 第二次请求就是 cf-cache-status: HIT / age: 1）。给一部镜像没有的片发一条
+// 镜像地址，等于把它钉死一年。
+//
+// 探测走 127.0.0.1，不经 CF，所以不会污染边缘缓存。结果缓存 1 小时。
+func (s *Server) mirrorAvailable(cid string) bool {
+	base := strings.TrimRight(s.cfg.FallbackMirrorBase, "/")
+	if base == "" || cid == "" {
+		return false
+	}
+
+	s.mirrorMu.Lock()
+	if p, ok := s.mirrorCache[cid]; ok && time.Since(p.at) < mirrorCacheTTL {
+		s.mirrorMu.Unlock()
+		return p.ok
+	}
+	s.mirrorMu.Unlock()
+
+	ok := false
+	for _, c := range cidVariants(cid) {
+		p := mirrorHLSPath(c)
+		if p == "" {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, base+p, nil)
+		if err != nil {
+			break
+		}
+		resp, err := s.mirrorClient.Do(req)
+		if err != nil {
+			break
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			ok = true
+			break
+		}
+	}
+
+	s.mirrorMu.Lock()
+	if len(s.mirrorCache) >= mirrorCacheLimit {
+		s.mirrorCache = make(map[string]mirrorProbe, mirrorCacheLimit)
+	}
+	s.mirrorCache[cid] = mirrorProbe{ok: ok, at: time.Now()}
+	s.mirrorMu.Unlock()
+	return ok
+}
+
 func (s *Server) build(r Row, code string) map[string]any {
 	// fmt：0/1 → /litevideo/freepv，2/3 → /pv；偶数带下划线，奇数不带
 	file := r.stem + "_" + r.quality + "_" + r.variant + ".mp4"
@@ -312,6 +365,13 @@ func (s *Server) build(r Row, code string) map[string]any {
 		if i := strings.LastIndex(r.dirpath, "/"); i > 0 {
 			mirrorProxyHLS = s.signer.SignURL(base+"/mirror/hlsvideo/freepv/"+
 				r.dirpath[:i]+"/"+strings.ToLower(r.cid)+"/playlist.m3u8", now)
+		} else if p := mirrorHLSPath(r.cid); p != "" && s.mirrorAvailable(r.cid) {
+			// /pv/ 体系的行，dirpath 是 token（不含斜杠），上面那条拼不出来 ——
+			// 这是 SNOS-428 只剩 proxy/direct 两条候选、proxy 配额爆了之后
+			// 整片播不了的原因。HLS 目录用 cid 机械推导即可：
+			//   snos00428 → /hlsvideo/freepv/s/sno/snos00428/playlist.m3u8
+			// 拼之前先探一次（结果缓存 1 小时），避免把 404 写进 CF 的一年缓存。
+			mirrorProxyHLS = s.signer.SignURL(base+"/mirror"+p, now)
 		}
 	}
 	if mirrorProxyMP4 != "" {
@@ -429,7 +489,27 @@ type Server struct {
 	lookups atomic.Int64
 	misses  atomic.Int64
 	hits    atomic.Int64 // 由实时回退补上的次数
+
+	// 镜像可用性缓存：cid → 能不能在本地 mirror 出流。
+	// 探一次要回源（dmm-mirror 用 uTLS 打 javtrailers），不能每个请求都探；
+	// 但也不能不探 —— CF 那条 /mirror/ 规则会把 404 也缓存一年，错发一条
+	// 必然 404 的地址等于把这部片钉死。
+	mirrorMu     sync.Mutex
+	mirrorCache  map[string]mirrorProbe
+	mirrorClient *http.Client
 }
+
+type mirrorProbe struct {
+	ok bool
+	at time.Time
+}
+
+// mirrorCacheTTL 是镜像探测结果的保质期。太短会让热门片反复回源，
+// 太长会让「镜像后来补上了」迟迟不生效。
+const mirrorCacheTTL = time.Hour
+
+// mirrorCacheLimit 只是防止 map 无限增长（进程常驻，长期跑会吃内存）。
+const mirrorCacheLimit = 20000
 
 func writeJSON(w http.ResponseWriter, status int, body any, extra map[string]string) {
 	w.Header().Set("content-type", "application/json; charset=utf-8")
@@ -580,7 +660,10 @@ func main() {
 		db:      db,
 		started: time.Now(),
 		// 签发方只关心「有没有 secret」，enforce 传 true 无副作用
-		signer: NewSigner(cfg.SignSecret, cfg.SignTTLDays, true),
+		signer:      NewSigner(cfg.SignSecret, cfg.SignTTLDays, true),
+		mirrorCache: make(map[string]mirrorProbe),
+		// 探测本地 mirror：不走代理、超时短，失败就当没有
+		mirrorClient: &http.Client{Timeout: 4 * time.Second},
 	}
 
 	// 实时回退是增强项：初始化失败只记日志，服务照常跑（查不到就是 404）。

@@ -403,3 +403,52 @@ func TestPVQualityVariantsInvalid(t *testing.T) {
 		}
 	}
 }
+
+/* ---------- 索引命中路径的镜像可用性探测 ---------- */
+
+func newProbeServer(t *testing.T, handler http.HandlerFunc) *Server {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return &Server{
+		cfg:          Config{FallbackMirrorBase: srv.URL + "/mirror"},
+		mirrorCache:  make(map[string]mirrorProbe),
+		mirrorClient: &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// 200 → 可用；结果要缓存，第二次不能再打一次（探测要回源，很贵）
+func TestMirrorAvailableCachesPositive(t *testing.T) {
+	var calls int
+	s := newProbeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		io.WriteString(w, "#EXTM3U")
+	})
+	if !s.mirrorAvailable("snos00428") {
+		t.Fatal("镜像有源时应返回 true")
+	}
+	if !s.mirrorAvailable("snos00428") {
+		t.Fatal("第二次仍应为 true")
+	}
+	if calls != 1 {
+		t.Fatalf("结果应被缓存，实际探测了 %d 次", calls)
+	}
+}
+
+// 404 → 不可用，**不能**下发镜像候选（否则 CF 会把 404 缓存一年）
+func TestMirrorAvailableNegative(t *testing.T) {
+	s := newProbeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	if s.mirrorAvailable("zzz99999") {
+		t.Fatal("镜像没有时应返回 false")
+	}
+}
+
+// 没配 mirror base 时一律 false（不生成镜像候选）
+func TestMirrorAvailableDisabled(t *testing.T) {
+	s := &Server{mirrorCache: make(map[string]mirrorProbe)}
+	if s.mirrorAvailable("snos00428") {
+		t.Fatal("未配置 MirrorBase 时应返回 false")
+	}
+}
